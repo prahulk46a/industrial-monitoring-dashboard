@@ -13,8 +13,6 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-
-
 // ==================== HELPER code ====================
 const dbConfig = {
   host: "localhost",
@@ -69,7 +67,20 @@ app.get("/api/digital-inputs/readings", async (req, res) => {
     handleError(res, error);
   }
 });
+// GET all analog input tags
+app.get("/api/analog-inputs/tags", async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    const [rows] = await connection.execute(
+      "SELECT * FROM analog_input_tags ORDER BY id"
+    );
+    connection.release();
 
+    apiResponse(res, 200, "Analog input tags retrieved", rows);
+  } catch (error) {
+    handleError(res, error);
+  }
+});
 // GET digital output readings
 app.get("/api/digital-outputs/readings", async (req, res) => {
   let connection;
@@ -394,6 +405,535 @@ app.get("/api/readings/time-range", async (req, res) => {
   }
 });
 
+// ==================== MACHINE RUNTIME OVERVIEW ====================
+
+// GET machine runtime statistics - Complete Dashboard View
+app.get("/api/machine-runtime/overview", async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+
+    // Get current 24-hour runtime data
+    const [runtimeData24h] = await connection.execute(`
+      SELECT 
+        SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) as running_count,
+        SUM(CASE WHEN value = 0 THEN 1 ELSE 0 END) as idle_count,
+        COUNT(*) as total_readings
+      FROM digital_input_readings
+      WHERE tag_id = 'DI-005' 
+        AND timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+    `);
+
+    // Get 7-day runtime breakdown by day
+    const [runtimeBy7Days] = await connection.execute(`
+      SELECT 
+        DATE(timestamp) as date,
+        SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) as running_count,
+        SUM(CASE WHEN value = 0 THEN 1 ELSE 0 END) as idle_count,
+        COUNT(*) as total_readings,
+        ROUND((SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) / COUNT(*) * 100), 2) as runtime_percentage
+      FROM digital_input_readings
+      WHERE tag_id = 'DI-005' 
+        AND timestamp >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+      GROUP BY DATE(timestamp)
+      ORDER BY date DESC
+    `);
+
+    // Calculate current runtime metrics (24h)
+    const totalReadings = runtimeData24h[0]?.total_readings || 0;
+    const runningCount = runtimeData24h[0]?.running_count || 0;
+    const idleCount = runtimeData24h[0]?.idle_count || 0;
+    const runtimePercentage = totalReadings > 0 ? parseFloat(((runningCount / totalReadings) * 100).toFixed(2)) : 0;
+
+    // Assuming 30-second intervals between readings
+    const readingIntervalSeconds = 30;
+    const runtimeSeconds = runningCount * readingIntervalSeconds;
+    const runtimeHours = parseFloat((runtimeSeconds / 3600).toFixed(2));
+    const runtimeMinutes = parseFloat(((runtimeSeconds % 3600) / 60).toFixed(0));
+
+    // Get equipment runtime breakdown (MIXER & PUMP)
+    const [equipmentRuntime] = await connection.execute(`
+      SELECT 
+        tag_id,
+        (SELECT description FROM digital_input_tags WHERE tag_id = dir.tag_id LIMIT 1) as description,
+        SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) as running_count,
+        COUNT(*) as total_readings,
+        ROUND((SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) / COUNT(*) * 100), 2) as runtime_percentage,
+        MAX(timestamp) as last_updated
+      FROM digital_input_readings dir
+      WHERE tag_id IN ('DI-005', 'DI-008')
+        AND timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+      GROUP BY tag_id
+      ORDER BY runtime_percentage DESC
+    `);
+
+    // Get machine status pie chart (Running, Ideal, Downtime distribution)
+    const [machineStatus] = await connection.execute(`
+      SELECT 
+        tag_id,
+        (SELECT description FROM digital_input_tags WHERE tag_id = dir.tag_id LIMIT 1) as description,
+        CASE 
+          WHEN SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) / COUNT(*) >= 0.8 THEN 'Running'
+          WHEN SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) / COUNT(*) >= 0.5 THEN 'Ideal'
+          ELSE 'Downtime'
+        END as status,
+        COUNT(*) as count
+      FROM digital_input_readings
+      WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        AND tag_id IN ('DI-005', 'DI-008')
+      GROUP BY tag_id
+    `);
+
+    // Get hourly runtime distribution (for chart)
+    const [hourlyRuntime] = await connection.execute(`
+      SELECT 
+        DATE_FORMAT(timestamp, '%Y-%m-%d %H:00:00') as hour,
+        SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) as running_count,
+        COUNT(*) as total_readings,
+        ROUND((SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) / COUNT(*) * 100), 2) as runtime_percentage
+      FROM digital_input_readings
+      WHERE tag_id = 'DI-005'
+        AND timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+      GROUP BY DATE_FORMAT(timestamp, '%Y-%m-%d %H:00:00')
+      ORDER BY hour ASC
+    `);
+
+    // Get status breakdown for pie chart
+    const statusCounts = {
+      running: 0,
+      ideal: 0,
+      fault: 0,
+      downtime: 0
+    };
+
+    for (const machine of machineStatus) {
+      if (machine.status === 'Running') statusCounts.running++;
+      else if (machine.status === 'Ideal') statusCounts.ideal++;
+      else if (machine.status === 'Downtime') statusCounts.downtime++;
+    }
+
+    connection.release();
+
+    // Calculate totals for pie chart
+    const totalMachines = statusCounts.running + statusCounts.ideal + statusCounts.fault + statusCounts.downtime;
+
+    apiResponse(res, 200, "Machine runtime overview retrieved", {
+      currentMetrics: {
+        runtimePercentage: runtimePercentage,
+        runtimeHours: runtimeHours,
+        runtimeMinutes: runtimeMinutes,
+        idleTime: `${Math.floor((idleCount * readingIntervalSeconds) / 3600)}h ${Math.floor(((idleCount * readingIntervalSeconds) % 3600) / 60)}m`,
+        totalReadings: totalReadings
+      },
+      equipmentBreakdown: equipmentRuntime.map(eq => ({
+        tagId: eq.tag_id,
+        description: eq.description,
+        runtimePercentage: parseFloat(eq.runtime_percentage),
+        runtimeHours: parseFloat(((eq.running_count * readingIntervalSeconds) / 3600).toFixed(2)),
+        lastUpdated: eq.last_updated
+      })),
+      statusDistribution: {
+        running: statusCounts.running,
+        ideal: statusCounts.ideal,
+        fault: statusCounts.fault,
+        downtime: statusCounts.downtime,
+        total: totalMachines
+      },
+      dailyBreakdown: runtimeBy7Days.map(day => ({
+        date: day.date,
+        runtimePercentage: parseFloat(day.runtime_percentage),
+        runtimeHours: parseFloat(((day.running_count * readingIntervalSeconds) / 3600).toFixed(2)),
+        runningCount: day.running_count,
+        idleCount: day.idle_count
+      })),
+      hourlyTrend: hourlyRuntime.map(hour => ({
+        time: hour.hour,
+        runtimePercentage: parseFloat(hour.runtime_percentage),
+        runningCount: hour.running_count,
+        totalCount: hour.total_readings
+      }))
+    });
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// GET machine runtime by equipment with actual running time
+app.get("/api/machine-runtime/by-equipment", async (req, res) => {
+  let connection;
+  try {
+    const { days = 7 } = req.query;
+
+    connection = await pool.getConnection();
+
+    const [runtimeByEquipment] = await connection.execute(`
+      SELECT 
+        dir.tag_id,
+        (SELECT description FROM digital_input_tags WHERE tag_id = dir.tag_id LIMIT 1) as description,
+        DATE(dir.timestamp) as date,
+        SUM(CASE WHEN dir.value = 1 THEN 1 ELSE 0 END) as running_count,
+        COUNT(*) as total_readings,
+        ROUND((SUM(CASE WHEN dir.value = 1 THEN 1 ELSE 0 END) / COUNT(*)) * 100, 2) as runtime_percentage
+      FROM digital_input_readings dir
+      WHERE dir.timestamp >= DATE_SUB(NOW(), INTERVAL ? DAY)
+        AND dir.tag_id IN ('DI-005', 'DI-008')
+      GROUP BY dir.tag_id, DATE(dir.timestamp)
+      ORDER BY dir.tag_id, date DESC
+    `, [parseInt(days)]);
+
+    connection.release();
+
+    // Calculate actual running time in hours and minutes for each record
+    const formattedData = runtimeByEquipment.map(record => {
+      const readingIntervalSeconds = 30;
+      const runtimeSeconds = record.running_count * readingIntervalSeconds;
+      const runtimeHours = Math.floor(runtimeSeconds / 3600);
+      const runtimeMinutes = Math.floor((runtimeSeconds % 3600) / 60);
+      
+      return {
+        tagId: record.tag_id,
+        description: record.description,
+        date: record.date,
+        runningCount: record.running_count,
+        totalReadings: record.total_readings,
+        runtimePercentage: parseFloat(record.runtime_percentage),
+        runtimeHours: runtimeHours,
+        runtimeMinutes: runtimeMinutes,
+        runtimeFormatted: `${runtimeHours}h ${runtimeMinutes}m`,
+        totalRuntimeSeconds: runtimeSeconds
+      };
+    });
+
+    apiResponse(res, 200, "Equipment runtime data retrieved", formattedData);
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// GET total machine running time (summary)
+app.get("/api/machine-runtime/total-time", async (req, res) => {
+  let connection;
+  try {
+    const { days = 7, tagId = "DI-005" } = req.query;
+
+    connection = await pool.getConnection();
+
+    // Get total running time for specified period
+    const [totalRuntime] = await connection.execute(`
+      SELECT 
+        COUNT(*) as total_readings,
+        SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) as running_count,
+        SUM(CASE WHEN value = 0 THEN 1 ELSE 0 END) as idle_count,
+        MIN(timestamp) as start_time,
+        MAX(timestamp) as end_time
+      FROM digital_input_readings
+      WHERE tag_id = ? AND timestamp >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    `, [tagId, parseInt(days)]);
+
+    // Get running time by each continuous session
+    const [runningSessions] = await connection.execute(`
+      SELECT 
+        MIN(timestamp) as session_start,
+        MAX(timestamp) as session_end,
+        COUNT(*) as reading_count,
+        DATE(timestamp) as session_date
+      FROM digital_input_readings
+      WHERE tag_id = ? AND value = 1 AND timestamp >= DATE_SUB(NOW(), INTERVAL ? DAY)
+      GROUP BY SESSION_ID, DATE(timestamp)
+      ORDER BY session_start DESC
+      LIMIT 100
+    `, [tagId, parseInt(days)]);
+
+    const readingIntervalSeconds = 30;
+    const data = totalRuntime[0];
+    
+    const totalReadingSeconds = data.total_readings * readingIntervalSeconds;
+    const totalPeriodHours = Math.floor(totalReadingSeconds / 3600);
+    const totalPeriodMinutes = Math.floor((totalReadingSeconds % 3600) / 60);
+
+    const runningSeconds = data.running_count * readingIntervalSeconds;
+    const runningHours = Math.floor(runningSeconds / 3600);
+    const runningMinutes = Math.floor((runningSeconds % 3600) / 60);
+
+    const idleSeconds = data.idle_count * readingIntervalSeconds;
+    const idleHours = Math.floor(idleSeconds / 3600);
+    const idleMinutes = Math.floor((idleSeconds % 3600) / 60);
+
+    const runtimePercentage = data.total_readings > 0 ? ((data.running_count / data.total_readings) * 100).toFixed(2) : 0;
+
+    connection.release();
+
+    apiResponse(res, 200, "Total machine running time retrieved", {
+      period: {
+        days: parseInt(days),
+        startTime: data.start_time,
+        endTime: data.end_time
+      },
+      summary: {
+        totalReadings: data.total_readings,
+        runtimePercentage: parseFloat(runtimePercentage),
+        totalPeriod: {
+          hours: totalPeriodHours,
+          minutes: totalPeriodMinutes,
+          formatted: `${totalPeriodHours}h ${totalPeriodMinutes}m`
+        },
+        runningTime: {
+          hours: runningHours,
+          minutes: runningMinutes,
+          seconds: runningSeconds % 60,
+          formatted: `${runningHours}h ${runningMinutes}m ${runningSeconds % 60}s`,
+          totalSeconds: runningSeconds
+        },
+        idleTime: {
+          hours: idleHours,
+          minutes: idleMinutes,
+          seconds: idleSeconds % 60,
+          formatted: `${idleHours}h ${idleMinutes}m ${idleSeconds % 60}s`,
+          totalSeconds: idleSeconds
+        }
+      },
+      readingDetails: {
+        runningReadings: data.running_count,
+        idleReadings: data.idle_count,
+        totalReadings: data.total_readings,
+        readingIntervalSeconds: readingIntervalSeconds
+      }
+    });
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+
+
+// GET daily running time report (Running + Idle + Random Fault)
+app.get("/api/machine-runtime/daily-report", async (req, res) => {
+  let connection;
+  try {
+    const { days = 30, tagId = "DI-005" } = req.query;
+
+    connection = await pool.getConnection();
+
+    const [dailyRuntime] = await connection.execute(`
+      SELECT 
+        DATE(timestamp) as date,
+        SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) as running_count,
+        SUM(CASE WHEN value = 0 THEN 1 ELSE 0 END) as idle_count,
+        COUNT(*) as total_readings,
+        ROUND(
+          (SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) / COUNT(*)) * 100,
+          2
+        ) as runtime_percentage,
+        MIN(timestamp) as first_reading,
+        MAX(timestamp) as last_reading
+      FROM digital_input_readings
+      WHERE tag_id = ?
+        AND timestamp >= DATE_SUB(NOW(), INTERVAL ? DAY)
+      GROUP BY DATE(timestamp)
+      ORDER BY date DESC
+    `, [tagId, parseInt(days)]);
+
+    const readingIntervalSeconds = 30;
+
+    const getRandomInt = (min, max) =>
+      Math.floor(Math.random() * (max - min + 1)) + min;
+
+    const formattedReport = dailyRuntime.map(day => {
+      const totalSeconds = day.total_readings * readingIntervalSeconds;
+      const runningSeconds = day.running_count * readingIntervalSeconds;
+
+      // Random fault time (0–15%)
+      const faultPercentage = getRandomInt(0, 15);
+      const faultSeconds = Math.floor((faultPercentage / 100) * totalSeconds);
+
+      // Idle time = remaining
+      let idleSeconds = totalSeconds - runningSeconds - faultSeconds;
+      if (idleSeconds < 0) idleSeconds = 0;
+
+      const toTime = seconds => ({
+        hours: Math.floor(seconds / 3600),
+        minutes: Math.floor((seconds % 3600) / 60),
+        totalSeconds: seconds,
+        formatted: `${Math.floor(seconds / 3600)}h ${Math.floor(
+          (seconds % 3600) / 60
+        )}m`
+      });
+
+      return {
+        date: day.date,
+        runtimePercentage: parseFloat(day.runtime_percentage),
+
+        runningTime: toTime(runningSeconds),
+        idleTime: toTime(idleSeconds),
+        faultTime: {
+          ...toTime(faultSeconds),
+          percentage: faultPercentage
+        },
+
+        readings: {
+          running: day.running_count,
+          idle: Math.floor(idleSeconds / readingIntervalSeconds),
+          fault: Math.floor(faultSeconds / readingIntervalSeconds),
+          total: day.total_readings
+        },
+
+        timeRange: {
+          start: day.first_reading,
+          end: day.last_reading
+        }
+      };
+    });
+
+    apiResponse(res, 200, "Daily running time report retrieved", {
+      period: {
+        days: parseInt(days),
+        tagId
+      },
+      readingIntervalSeconds,
+      dailyData: formattedReport
+    });
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+
+// ==================== ALARM FREQUENCY BY TYPE ====================
+
+// GET alarm frequency by type/priority
+app.get("/api/alarms/frequency/by-type", async (req, res) => {
+  let connection;
+  try {
+    const { days = 7 } = req.query;
+
+    connection = await pool.getConnection();
+
+    // Get alarm frequency by priority
+    const [frequencyByPriority] = await connection.execute(`
+      SELECT 
+        priority,
+        COUNT(*) as count,
+        ROUND((COUNT(*) / (SELECT COUNT(*) FROM alarms WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) * 100), 2) as percentage
+      FROM alarms
+      WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+      GROUP BY priority
+      ORDER BY 
+        CASE 
+          WHEN priority = 'CRITICAL' THEN 1
+          WHEN priority = 'MODERATE' THEN 2
+          ELSE 3
+        END
+    `, [parseInt(days), parseInt(days)]);
+
+    // Get alarm frequency by tag
+    const [frequencyByTag] = await connection.execute(`
+      SELECT 
+        tag_id,
+        (SELECT description FROM analog_input_tags WHERE tag_id = a.tag_id LIMIT 1) as description,
+        priority,
+        COUNT(*) as count,
+        DATE(triggered_at) as date
+      FROM alarms a
+      WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+      GROUP BY tag_id, priority, DATE(triggered_at)
+      ORDER BY tag_id, date DESC, count DESC
+    `, [parseInt(days)]);
+
+    // Get alarm frequency trend (daily)
+    const [frequencyTrend] = await connection.execute(`
+      SELECT 
+        DATE(triggered_at) as date,
+        priority,
+        COUNT(*) as count
+      FROM alarms
+      WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+      GROUP BY DATE(triggered_at), priority
+      ORDER BY date DESC, 
+        CASE 
+          WHEN priority = 'CRITICAL' THEN 1
+          WHEN priority = 'MODERATE' THEN 2
+          ELSE 3
+        END
+    `, [parseInt(days)]);
+
+    // Get alarm statistics summary
+    const [alarmStats] = await connection.execute(`
+      SELECT 
+        COUNT(*) as total_alarms,
+        SUM(CASE WHEN priority = 'CRITICAL' THEN 1 ELSE 0 END) as critical_count,
+        SUM(CASE WHEN priority = 'MODERATE' THEN 1 ELSE 0 END) as moderate_count,
+        SUM(CASE WHEN priority = 'HEALTHY' THEN 1 ELSE 0 END) as healthy_count,
+        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active_count,
+        SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved_count,
+        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, resolved_at)) as avg_resolution_time_minutes
+      FROM alarms
+      WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    `, [parseInt(days)]);
+
+    connection.release();
+
+    apiResponse(res, 200, "Alarm frequency data retrieved", {
+      summary: alarmStats[0],
+      frequencyByPriority: frequencyByPriority,
+      frequencyByTag: frequencyByTag,
+      frequencyTrend: frequencyTrend
+    });
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// GET alarm frequency pie chart data (simplified)
+app.get("/api/alarms/frequency/pie-chart", async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+
+    const [pieData] = await connection.execute(`
+      SELECT 
+        priority,
+        COUNT(*) as count,
+        ROUND((COUNT(*) / (SELECT COUNT(*) FROM alarms) * 100), 2) as percentage
+      FROM alarms
+      GROUP BY priority
+      ORDER BY 
+        CASE 
+          WHEN priority = 'CRITICAL' THEN 1
+          WHEN priority = 'MODERATE' THEN 2
+          ELSE 3
+        END
+    `);
+
+    connection.release();
+
+    const formattedData = pieData.map(item => ({
+      name: item.priority,
+      value: item.count,
+      percentage: parseFloat(item.percentage)
+    }));
+
+    apiResponse(res, 200, "Alarm frequency pie chart data retrieved", formattedData);
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+
+
+
+
 // ==================== HEALTH CHECK ====================
 
 app.get("/api/health", (req, res) => {
@@ -487,35 +1027,35 @@ const ALARM_LEVELS = {
 };
 
 const DIGITAL_INPUT_TAGS = [
-  { id: 1, tagId: "DI-001", description: "VOLTAGE PROTECTION RELAY" },
-  { id: 2, tagId: "DI-002", description: "EMERGENCY STOP" },
-  { id: 3, tagId: "DI-003", description: "BUZZER RESET PB" },
-  { id: 4, tagId: "DI-004", description: "MIXER VFD TRIP" },
-  { id: 5, tagId: "DI-005", description: "MIXER VFD RUN" },
-  { id: 6, tagId: "DI-006", description: "MIXER VFD HEALTHY" },
-  { id: 7, tagId: "DI-007", description: "CIRCULATION PUMP TRIP" },
-  { id: 8, tagId: "DI-008", description: "CIRCULATION PUMP RUN" },
+  { id: 1, tagId: "DI-001", description: "Voltage Protection Relay" },
+  { id: 2, tagId: "DI-002", description: "Emergency Stop" },
+  { id: 3, tagId: "DI-003", description: "Buzzer Reset PB" },
+  { id: 4, tagId: "DI-004", description: "Mixer VFD Trip" },
+  { id: 5, tagId: "DI-005", description: "Mixer VFD Run" },
+  { id: 6, tagId: "DI-006", description: "Mixer VFD Healthy" },
+  { id: 7, tagId: "DI-007", description: "Circulation Pump Trip" },
+  { id: 8, tagId: "DI-008", description: "Circulation Pump Run" },
 ];
 
 const DIGITAL_OUTPUT_TAGS = [
-  { id: 1, tagId: "DO-001", description: "BUZZER " },
-  { id: 2, tagId: "DO-002", description: "EMERGENCY" },
-  { id: 3, tagId: "DO-003", description: "CIP VALVE-1 " },
-  { id: 4, tagId: "DO-004", description: "SIP VALVE-1 " },
+  { id: 1, tagId: "DO-001", description: "Buzzer" },
+  { id: 2, tagId: "DO-002", description: "Emergency" },
+  { id: 3, tagId: "DO-003", description: "CIP Valve-1 " },
+  { id: 4, tagId: "DO-004", description: "SIP Valve-1 " },
 ];
 
 const ANALOG_INPUT_TAGS = [
-  { tagId: "AI-001", description: "LINE 1 - PRESSURE", unit: "bar", baseValue: 5, volatility: 1.5, minValue: 0, maxValue: 10 },
-  { tagId: "AI-002", description: "LINE 1 - TEMPERATURE", unit: "°C", baseValue: 50, volatility: 8, minValue: 0, maxValue: 100 },
-  { tagId: "AI-003", description: "LINE 2 - TEMPERATURE", unit: "°C", baseValue: 48, volatility: 7, minValue: 0, maxValue: 100 },
-  { tagId: "AI-004", description: "DO TRANSMITTER", unit: "%", baseValue: 45, volatility: 12, minValue: 0, maxValue: 100 },
-  { tagId: "AI-005", description: "LOAD CELL", unit: "kg", baseValue: 25, volatility: 3, minValue: 0, maxValue: 50 },
-  { tagId: "AI-006", description: "COND PH SENSOR", unit: "pH", baseValue: 7, volatility: 0.8, minValue: 0, maxValue: 14 },
-  { tagId: "AI-007", description: "MAGNETIC MIXER", unit: "RPM", baseValue: 1100, volatility: 80, minValue: 0, maxValue: 1500 },
+  { tagId: "AI-001", description: "Line 1 - Pressure", unit: "bar", baseValue: 5, volatility: 1.5, minValue: 0, maxValue: 10 },
+  { tagId: "AI-002", description: "Line 1 - Temprature", unit: "°C", baseValue: 50, volatility: 8, minValue: 0, maxValue: 100 },
+  { tagId: "AI-003", description: "Line 2 - Temprature", unit: "°C", baseValue: 48, volatility: 7, minValue: 0, maxValue: 100 },
+  { tagId: "AI-004", description: "DO Trasnmitter", unit: "%", baseValue: 45, volatility: 12, minValue: 0, maxValue: 100 },
+  { tagId: "AI-005", description: "Load Cell", unit: "kg", baseValue: 25, volatility: 3, minValue: 0, maxValue: 50 },
+  { tagId: "AI-006", description: "Cond PH Sensor", unit: "pH", baseValue: 7, volatility: 0.8, minValue: 0, maxValue: 14 },
+  { tagId: "AI-007", description: "Magnetic Mixer", unit: "RPM", baseValue: 1100, volatility: 80, minValue: 0, maxValue: 1500 },
 ];
 
 const ANALOG_OUTPUT_TAGS = [
-  { tagId: "AO-001", description: "CONTROL VALVE", unit: "%", baseValue: 50, volatility: 15, minValue: 0, maxValue: 100 },
+  { tagId: "AO-001", description: "Control Valve", unit: "%", baseValue: 50, volatility: 15, minValue: 0, maxValue: 100 },
 ];
 
 // Helper functions
@@ -541,37 +1081,109 @@ function generateAlarmId() {
   return `ALM-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
+const ALARM_DESCRIPTION_TEMPLATES = {
+  TEMPERATURE: {
+    CRITICAL: (name, value, unit, threshold) =>
+      `${name} temperature is critically high at ${value} ${unit}. Maximum limit is ${threshold.critical}. Immediate action required.`,
+    MODERATE: (name, value, unit, threshold) =>
+      `${name} temperature is above normal at ${value} ${unit}. Warning limit is ${threshold.moderate}. Monitor closely.`,
+    HEALTHY: (name, value, unit) =>
+      `${name} temperature is normal at ${value} ${unit}.`
+  },
+
+  PRESSURE: {
+    CRITICAL: (name, value, unit, threshold) =>
+      `${name} pressure has exceeded the critical limit at ${value} ${unit}. Safe limit is ${threshold.critical}. Immediate intervention required.`,
+    MODERATE: (name, value, unit, threshold) =>
+      `${name} pressure is approaching unsafe levels at ${value} ${unit}. Warning limit is ${threshold.moderate}.`,
+    HEALTHY: (name, value, unit) =>
+      `${name} pressure is within safe operating range at ${value} ${unit}.`
+  },
+
+  FLOW: {
+    CRITICAL: (name, value, unit, threshold) =>
+      `${name} flow rate is critically abnormal at ${value} ${unit}. Expected limit is ${threshold.critical}.`,
+    MODERATE: (name, value, unit, threshold) =>
+      `${name} flow rate is outside normal range at ${value} ${unit}.`,
+    HEALTHY: (name, value, unit) =>
+      `${name} flow rate is normal at ${value} ${unit}.`
+  },
+
+  DEFAULT: {
+    CRITICAL: (name, value, unit) =>
+      `${name} value is critically abnormal at ${value} ${unit}. Immediate attention required.`,
+    MODERATE: (name, value, unit) =>
+      `${name} value is outside normal range at ${value} ${unit}.`,
+    HEALTHY: (name, value, unit) =>
+      `${name} value is normal at ${value} ${unit}.`
+  }
+};
+
+function getTagCategory(tagInfo) {
+  const text = `${tagInfo?.description || ""}`.toLowerCase();
+
+  if (text.includes("temp")) return "TEMPERATURE";
+  if (text.includes("pressure")) return "PRESSURE";
+  if (text.includes("flow")) return "FLOW";
+
+  return "DEFAULT";
+}
+
 function createAlarmObject(tagId, value, alarmLevel, timestamp) {
   const threshold = ALARM_THRESHOLDS[tagId];
-  const levelConfig = ALARM_LEVELS[alarmLevel];
-  
-  // Find tag description from ANALOG_INPUT_TAGS
+
   const tagInfo = ANALOG_INPUT_TAGS.find(t => t.tagId === tagId);
-  const tagDescription = tagInfo ? tagInfo.description : tagId;
+  const tagName = tagInfo?.description || tagId;
+  const unit = threshold?.unit || "";
+
+  const category = getTagCategory(tagInfo);
+  const templates =
+    ALARM_DESCRIPTION_TEMPLATES[category] ||
+    ALARM_DESCRIPTION_TEMPLATES.DEFAULT;
+
+  const descriptionBuilder =
+    templates[alarmLevel] || ALARM_DESCRIPTION_TEMPLATES.DEFAULT[alarmLevel];
+
+  const description = descriptionBuilder(
+    tagName,
+    value,
+    unit,
+    threshold
+  );
 
   return {
     id: generateAlarmId(),
     tag_id: tagId,
+    tag_name: tagName,
     tag_type: "ANALOG_INPUT",
-    priority: alarmLevel, // CRITICAL, MODERATE, HEALTHY
-    description: `${tagDescription} - Value: ${value} ${threshold.unit}${
-      alarmLevel === "CRITICAL"
-        ? `. Critical threshold: ${threshold.critical}`
-        : alarmLevel === "MODERATE"
-        ? `. Moderate threshold: ${threshold.moderate}`
-        : ""
-    }. Requires attention.`,
-    triggered_value: `${value} ${threshold.unit}`,
+    priority: alarmLevel,
+    description,
+    triggered_value: `${value} ${unit}`,
     triggered_at: timestamp.toISOString(),
     acknowledged_at: null,
     resolved_at: null,
-    status: "ACTIVE",
+    status: "ACTIVE"
   };
 }
 
-// Global alarm tracker
+
 const alarmTracker = new AlarmTracker();
 let dataStreamCounter = 0;
+
+app.get("/api/digital-inputs/tags", async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    const [rows] = await connection.execute(
+      "SELECT * FROM digital_input_tags ORDER BY id"
+    );
+    connection.release();
+
+    apiResponse(res, 200, "Digital input tags retrieved", rows);
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
 
 // Data publishing function
 async function publishSampleData() {
@@ -594,6 +1206,7 @@ async function publishSampleData() {
         value: value,
       });
     }
+
 
     // Generate Digital Outputs
     const digitalOutputs = [];
@@ -654,12 +1267,13 @@ async function publishSampleData() {
       try {
         // Check if table structure exists, if not create simplified version
         await connection.execute(
-          `INSERT INTO alarms (id, tag_id, tag_type, priority, description, triggered_value, triggered_at, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO alarms (id, tag_id, tag_type, tag_name, priority, description, triggered_value, triggered_at, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             alarm.id,
             alarm.tag_id,
             alarm.tag_type,
+            alarm.tag_name,
             alarm.priority,
             alarm.description,
             alarm.triggered_value,
@@ -685,8 +1299,6 @@ async function publishSampleData() {
     console.error("❌ Error publishing data:", error);
   }
 }
-
-// ==================== DATABASE INITIALIZATION ====================
 
 async function initializeDatabase() {
   try {
@@ -761,9 +1373,8 @@ async function initializeDatabase() {
   }
 }
 
-// Start publishing data every 30 seconds
 setInterval(publishSampleData, 30000);
-// ==================== SERVER START ====================
+
 app.listen(PORT, async () => {
   // Initialize database first
   await initializeDatabase();
@@ -793,3 +1404,4 @@ app.listen(PORT, async () => {
 
   console.log("GET /api/health\n");
 });
+

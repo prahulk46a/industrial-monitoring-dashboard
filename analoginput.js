@@ -1,17 +1,4 @@
-// GET all analog input tags
-app.get("/api/analog-inputs/tags", async (req, res) => {
-  try {
-    const connection = await pool.getConnection();
-    const [rows] = await connection.execute(
-      "SELECT * FROM analog_input_tags ORDER BY id"
-    );
-    connection.release();
 
-    apiResponse(res, 200, "Analog input tags retrieved", rows);
-  } catch (error) {
-    handleError(res, error);
-  }
-});
 
 
 // GET specific analog input with readings
