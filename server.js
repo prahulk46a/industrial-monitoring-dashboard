@@ -37,8 +37,6 @@ function handleError(res, error, statusCode = 500) {
   apiResponse(res, statusCode, error.message || "Internal Server Error");
 }
 
-
-
 // ==================== APIS ====================
 
 // GET digital input readings (latest)
@@ -963,34 +961,61 @@ class AlarmTracker {
     this.totalResolved = 0;
   }
 
-  checkAlarms(analogInputs, timestamp) {
+  checkAlarms(digitalInputs, digitalOutputs, analogInputs, analogOutputs, timestamp) {
     const newAlarms = [];
+    
+    // Check Digital Inputs
+    for (const input of digitalInputs) {
+      const alarm = this.checkTagForAlarm(input, "DIGITAL_INPUT", timestamp);
+      if (alarm) newAlarms.push(alarm);
+    }
+    
+    // Check Digital Outputs
+    for (const output of digitalOutputs) {
+      const alarm = this.checkTagForAlarm(output, "DIGITAL_OUTPUT", timestamp);
+      if (alarm) newAlarms.push(alarm);
+    }
+    
+    // Check Analog Inputs
     for (const input of analogInputs) {
-      const tagId = input.tagId;
-      const value = input.value;
-      const currentLevel = getAlarmLevel(tagId, value);
-      const existingAlarm = this.activeAlarms.get(tagId);
+      const alarm = this.checkTagForAlarm(input, "ANALOG_INPUT", timestamp);
+      if (alarm) newAlarms.push(alarm);
+    }
+    
+    // Check Analog Outputs
+    for (const output of analogOutputs) {
+      const alarm = this.checkTagForAlarm(output, "ANALOG_OUTPUT", timestamp);
+      if (alarm) newAlarms.push(alarm);
+    }
+    
+    return newAlarms;
+  }
 
-      if (currentLevel !== "HEALTHY") {
-        if (!existingAlarm || existingAlarm.level !== currentLevel) {
-          const alarm = createAlarmObject(tagId, value, currentLevel, timestamp);
-          this.activeAlarms.set(tagId, alarm);
-          this.totalAlarms++;
-          newAlarms.push(alarm);
-        } else {
-          existingAlarm.currentValue = value;
-          existingAlarm.timestamp = timestamp.toISOString();
-        }
+  checkTagForAlarm(tag, tagType, timestamp) {
+    const tagId = tag.tagId;
+    const value = tag.value;
+    const currentLevel = getAlarmLevel(tagId, value, tagType);
+    const existingAlarm = this.activeAlarms.get(tagId);
+
+    if (currentLevel !== "HEALTHY") {
+      if (!existingAlarm || existingAlarm.level !== currentLevel) {
+        const alarm = createAlarmObject(tagId, value, currentLevel, timestamp, tagType, tag);
+        this.activeAlarms.set(tagId, alarm);
+        this.totalAlarms++;
+        return alarm;
       } else {
-        if (existingAlarm) {
-          existingAlarm.status = "RESOLVED";
-          this.alarmHistory.push(existingAlarm);
-          this.activeAlarms.delete(tagId);
-          this.totalResolved++;
-        }
+        existingAlarm.currentValue = value;
+        existingAlarm.timestamp = timestamp.toISOString();
+      }
+    } else {
+      if (existingAlarm) {
+        existingAlarm.status = "RESOLVED";
+        this.alarmHistory.push(existingAlarm);
+        this.activeAlarms.delete(tagId);
+        this.totalResolved++;
       }
     }
-    return newAlarms;
+    return null;
   }
 
   getActiveAlarms() {
@@ -1009,8 +1034,25 @@ class AlarmTracker {
   }
 }
 
-// Alarm thresholds
+// Alarm thresholds for all tag types
 const ALARM_THRESHOLDS = {
+  // Digital Inputs - alarm when value changes to 1 (trigger state)
+  "DI-001": { moderate: 1, critical: 1, unit: "" },
+  "DI-002": { moderate: 1, critical: 1, unit: "" },
+  "DI-003": { moderate: 1, critical: 1, unit: "" },
+  "DI-004": { moderate: 1, critical: 1, unit: "" },
+  "DI-005": { moderate: 1, critical: 1, unit: "" },
+  "DI-006": { moderate: 1, critical: 1, unit: "" },
+  "DI-007": { moderate: 1, critical: 1, unit: "" },
+  "DI-008": { moderate: 1, critical: 1, unit: "" },
+  
+  // Digital Outputs - alarm when value changes to 1
+  "DO-001": { moderate: 1, critical: 1, unit: "" },
+  "DO-002": { moderate: 1, critical: 1, unit: "" },
+  "DO-003": { moderate: 1, critical: 1, unit: "" },
+  "DO-004": { moderate: 1, critical: 1, unit: "" },
+  
+  // Analog Inputs
   "AI-001": { moderate: 5, critical: 8, unit: "bar" },
   "AI-002": { moderate: 50, critical: 75, unit: "°C" },
   "AI-003": { moderate: 50, critical: 75, unit: "°C" },
@@ -1018,6 +1060,9 @@ const ALARM_THRESHOLDS = {
   "AI-005": { moderate: 25, critical: 40, unit: "kg" },
   "AI-006": { moderate: 7, critical: 9, unit: "pH" },
   "AI-007": { moderate: 750, critical: 1200, unit: "RPM" },
+  
+  // Analog Outputs
+  "AO-001": { moderate: 70, critical: 90, unit: "%" },
 };
 
 const ALARM_LEVELS = {
@@ -1069,9 +1114,19 @@ function generateRandomValue(baseValue, volatility, minValue, maxValue) {
   return parseFloat(Math.max(minValue, Math.min(maxValue, newValue)).toFixed(2));
 }
 
-function getAlarmLevel(tagId, value) {
+function getAlarmLevel(tagId, value, tagType) {
   const threshold = ALARM_THRESHOLDS[tagId];
   if (!threshold) return "HEALTHY";
+  
+  // For digital tags, alarm triggers when value equals 1
+  if (tagType === "DIGITAL_INPUT" || tagType === "DIGITAL_OUTPUT") {
+    if (value === 1 || value === true) {
+      return "CRITICAL"; // Digital state changes are critical
+    }
+    return "HEALTHY";
+  }
+  
+  // For analog tags, use threshold comparison
   if (value >= threshold.critical) return "CRITICAL";
   if (value >= threshold.moderate) return "MODERATE";
   return "HEALTHY";
@@ -1087,7 +1142,7 @@ const ALARM_DESCRIPTION_TEMPLATES = {
       `${name} temperature is critically high at ${value} ${unit}. Maximum limit is ${threshold.critical}. Immediate action required.`,
     MODERATE: (name, value, unit, threshold) =>
       `${name} temperature is above normal at ${value} ${unit}. Warning limit is ${threshold.moderate}. Monitor closely.`,
-    HEALTHY: (name, value, unit) =>
+    HEALTHY: (name, value, unit) => 
       `${name} temperature is normal at ${value} ${unit}.`
   },
 
@@ -1129,36 +1184,61 @@ function getTagCategory(tagInfo) {
   return "DEFAULT";
 }
 
-function createAlarmObject(tagId, value, alarmLevel, timestamp) {
+function createAlarmObject(tagId, value, alarmLevel, timestamp, tagType, tagInfo) {
   const threshold = ALARM_THRESHOLDS[tagId];
+  
+  // Get tag name and unit based on tag type
+  let tagName = tagId;
+  let unit = threshold?.unit || "";
+  
+  if (tagType === "DIGITAL_INPUT") {
+    const info = DIGITAL_INPUT_TAGS.find(t => t.tagId === tagId);
+    tagName = info?.description || tagId;
+  } else if (tagType === "DIGITAL_OUTPUT") {
+    const info = DIGITAL_OUTPUT_TAGS.find(t => t.tagId === tagId);
+    tagName = info?.description || tagId;
+  } else if (tagType === "ANALOG_INPUT") {
+    const info = ANALOG_INPUT_TAGS.find(t => t.tagId === tagId);
+    tagName = info?.description || tagId;
+    unit = info?.unit || unit;
+  } else if (tagType === "ANALOG_OUTPUT") {
+    const info = ANALOG_OUTPUT_TAGS.find(t => t.tagId === tagId);
+    tagName = info?.description || tagId;
+    unit = info?.unit || unit;
+  }
 
-  const tagInfo = ANALOG_INPUT_TAGS.find(t => t.tagId === tagId);
-  const tagName = tagInfo?.description || tagId;
-  const unit = threshold?.unit || "";
+  let description = "";
+  
+  if (tagType === "DIGITAL_INPUT" || tagType === "DIGITAL_OUTPUT") {
+    // Digital tag alarms
+    const typeLabel = tagType === "DIGITAL_INPUT" ? "Digital Input" : "Digital Output";
+    description = `${typeLabel} alarm triggered on ${tagName}. Current state: ${value === 1 || value === true ? "ON" : "OFF"}. Immediate attention required.`;
+  } else {
+    // Analog tag alarms
+    const category = getTagCategory(tagInfo);
+    const templates =
+      ALARM_DESCRIPTION_TEMPLATES[category] ||
+      ALARM_DESCRIPTION_TEMPLATES.DEFAULT;
 
-  const category = getTagCategory(tagInfo);
-  const templates =
-    ALARM_DESCRIPTION_TEMPLATES[category] ||
-    ALARM_DESCRIPTION_TEMPLATES.DEFAULT;
+    const descriptionBuilder =
+      templates[alarmLevel] || ALARM_DESCRIPTION_TEMPLATES.DEFAULT[alarmLevel];
 
-  const descriptionBuilder =
-    templates[alarmLevel] || ALARM_DESCRIPTION_TEMPLATES.DEFAULT[alarmLevel];
-
-  const description = descriptionBuilder(
-    tagName,
-    value,
-    unit,
-    threshold
-  );
+    description = descriptionBuilder(
+      tagName,
+      value,
+      unit,
+      threshold
+    );
+  }
 
   return {
     id: generateAlarmId(),
     tag_id: tagId,
     tag_name: tagName,
-    tag_type: "ANALOG_INPUT",
+    tag_type: tagType,
     priority: alarmLevel,
     description,
-    triggered_value: `${value} ${unit}`,
+    triggered_value: `${value}${unit ? ' ' + unit : ''}`,
     triggered_at: timestamp.toISOString(),
     acknowledged_at: null,
     resolved_at: null,
@@ -1259,8 +1339,8 @@ async function publishSampleData() {
       });
     }
 
-    // Check for alarms
-    const newAlarms = alarmTracker.checkAlarms(analogInputs, timestamp);
+    // Check for alarms for all tag types
+    const newAlarms = alarmTracker.checkAlarms(digitalInputs, digitalOutputs, analogInputs, analogOutputs, timestamp);
 
     // Store new alarms
     for (const alarm of newAlarms) {
