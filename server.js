@@ -220,6 +220,111 @@ app.get("/api/analog-inputs/readings", async (req, res) => {
   }
 });
 
+// ==================== EQUIPMENT STATUS APIS ====================
+
+// GET equipment status derived from digital inputs
+app.get("/api/equipment-status", async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+
+    // Get latest readings for all digital inputs
+    const [latestReadings] = await connection.execute(`
+      SELECT 
+        dir.tag_id,
+        dir.value,
+        dit.description,
+        MAX(dir.timestamp) as timestamp
+      FROM digital_input_readings dir
+      JOIN digital_input_tags dit ON dir.tag_id = dit.tag_id
+      GROUP BY dir.tag_id
+      ORDER BY dit.id
+    `);
+
+    connection.release();
+
+    // Map digital inputs to equipment status
+    const equipmentStatus = {};
+    
+    // Create a lookup map for quick access
+    const readings = {};
+    latestReadings.forEach(reading => {
+      readings[reading.tag_id] = reading;
+    });
+
+    // 1. VOLTAGE PROTECTION - DI-001
+    equipmentStatus.voltageProtection = {
+      name: "Voltage Protection",
+      status: readings['DI-001']?.value === 1 ? "unhealthy" : "healthy",
+      value: readings['DI-001']?.value,
+      timestamp: readings['DI-001']?.timestamp
+    };
+
+    // 2. EMERGENCY STOP - DI-002
+    equipmentStatus.emergencyStop = {
+      name: "Emergency Stop",
+      status: readings['DI-002']?.value === 1 ? "operated" : "healthy",
+      value: readings['DI-002']?.value,
+      timestamp: readings['DI-002']?.timestamp
+    };
+
+    // 3. BUZZER RESET PB - DI-003
+    equipmentStatus.buzzerReset = {
+      name: "Buzzer Reset PB",
+      status: readings['DI-003']?.value === 1 ? "operated" : "unoperated",
+      value: readings['DI-003']?.value,
+      timestamp: readings['DI-003']?.timestamp
+    };
+
+    // 4. MIXER VFD TRIP - DI-004
+    equipmentStatus.mixerVfdTrip = {
+      name: "Mixer VFD Trip",
+      status: readings['DI-004']?.value === 1 ? "operated" : "unoperated",
+      value: readings['DI-004']?.value,
+      timestamp: readings['DI-004']?.timestamp
+    };
+
+    // 5. MIXER VFD RUNNING - DI-005
+    equipmentStatus.mixerVfdRunning = {
+      name: "Mixer VFD Running",
+      status: readings['DI-005']?.value === 1 ? "running" : "not running",
+      value: readings['DI-005']?.value,
+      timestamp: readings['DI-005']?.timestamp
+    };
+
+    // 6. MIXER VFD HEALTHY - DI-006 (opposite of trip: if DI-004 operated then unhealthy)
+    equipmentStatus.mixerVfdHealth = {
+      name: "Mixer VFD Health",
+      status: readings['DI-004']?.value === 1 ? "unhealthy" : "healthy",
+      basedOnTrip: true,
+      tripValue: readings['DI-004']?.value,
+      timestamp: readings['DI-004']?.timestamp
+    };
+
+    // 7. CIRCULATION PUMP TRIP - DI-007
+    equipmentStatus.circulationPumpTrip = {
+      name: "Circulation Pump Trip",
+      status: readings['DI-007']?.value === 1 ? "operated" : "unoperated",
+      value: readings['DI-007']?.value,
+      timestamp: readings['DI-007']?.timestamp
+    };
+
+    // 8. CIRCULATION PUMP RUNNING & HEALTH - DI-008
+    // Health is opposite to pump run: if running (1) then healthy, if not running (0) then unhealthy
+    equipmentStatus.circulationPumpHealth = {
+      name: "Circulation Pump Health",
+      status: readings['DI-008']?.value === 1 ? "healthy" : "unhealthy",
+      basedOnRun: true,
+      runValue: readings['DI-008']?.value,
+      runStatus: readings['DI-008']?.value === 1 ? "running" : "not running",
+      timestamp: readings['DI-008']?.timestamp
+    };
+
+    apiResponse(res, 200, "Equipment status retrieved", equipmentStatus);
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
 // ==================== ALARM APIS ====================
 
 // GET all alarms with filters
@@ -317,7 +422,439 @@ app.post("/api/alarms/:alarmId/resolve", async (req, res) => {
   }
 });
 
-// GET alarm statistics
+// ==================== CUSTOM ALARM FILTER APIS ====================
+
+// GET alarms by date range
+app.get("/api/alarms/range/:startDate/:endDate", async (req, res) => {
+  let connection;
+  try {
+    const { startDate, endDate } = req.params;
+    const { status, priority, limit = 50, offset = 0 } = req.query;
+
+    connection = await pool.getConnection();
+
+    let query = `
+      SELECT *
+      FROM alarms
+      WHERE triggered_at BETWEEN ? AND ?
+    `;
+
+    const params = [startDate, endDate];
+
+    if (status) {
+      query += ` AND status = ?`;
+      params.push(status);
+    }
+
+    if (priority) {
+      query += ` AND priority = ?`;
+      params.push(priority);
+    }
+
+    query += ` ORDER BY triggered_at DESC LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), parseInt(offset));
+
+    const [rows] = await connection.execute(query, params);
+    
+    // Get total count for pagination
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM alarms
+      WHERE triggered_at BETWEEN ? AND ?
+    `;
+    const countParams = [startDate, endDate];
+    
+    if (status) {
+      countQuery += ` AND status = ?`;
+      countParams.push(status);
+    }
+    if (priority) {
+      countQuery += ` AND priority = ?`;
+      countParams.push(priority);
+    }
+
+    const [countResult] = await connection.execute(countQuery, countParams);
+    
+    connection.release();
+
+    apiResponse(res, 200, "Alarms retrieved by date range", {
+      period: { startDate, endDate },
+      pagination: {
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        total: countResult[0].total,
+        pages: Math.ceil(countResult[0].total / parseInt(limit))
+      },
+      filters: { status, priority },
+      alarms: rows
+    });
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// GET alarms by priority
+app.get("/api/alarms/by-priority/:priority", async (req, res) => {
+  let connection;
+  try {
+    const { priority } = req.params;
+    const { status, limit = 50, offset = 0, days = 30 } = req.query;
+
+    connection = await pool.getConnection();
+
+    let query = `
+      SELECT *
+      FROM alarms
+      WHERE priority = ?
+        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    `;
+
+    const params = [priority, parseInt(days)];
+
+    if (status) {
+      query += ` AND status = ?`;
+      params.push(status);
+    }
+
+    query += ` ORDER BY triggered_at DESC LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), parseInt(offset));
+
+    const [rows] = await connection.execute(query, params);
+
+    // Get count
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM alarms
+      WHERE priority = ?
+        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    `;
+    const countParams = [priority, parseInt(days)];
+
+    if (status) {
+      countQuery += ` AND status = ?`;
+      countParams.push(status);
+    }
+
+    const [countResult] = await connection.execute(countQuery, countParams);
+
+    // Get priority statistics
+    const [priorityStats] = await connection.execute(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active,
+        SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved,
+        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, resolved_at)) as avg_resolution_minutes
+      FROM alarms
+      WHERE priority = ?
+        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    `, [priority, parseInt(days)]);
+
+    connection.release();
+
+    apiResponse(res, 200, `Alarms retrieved by priority: ${priority}`, {
+      priority: priority,
+      period: { days: parseInt(days) },
+      statistics: {
+        total: priorityStats[0]?.total || 0,
+        active: priorityStats[0]?.active || 0,
+        resolved: priorityStats[0]?.resolved || 0,
+        avgResolutionMinutes: parseFloat(priorityStats[0]?.avg_resolution_minutes) || 0
+      },
+      pagination: {
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        total: countResult[0].total,
+        pages: Math.ceil(countResult[0].total / parseInt(limit))
+      },
+      alarms: rows
+    });
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// GET alarms by tag
+app.get("/api/alarms/by-tag/:tagId", async (req, res) => {
+  let connection;
+  try {
+    const { tagId } = req.params;
+    const { status, priority, limit = 50, offset = 0, days = 30 } = req.query;
+
+    connection = await pool.getConnection();
+
+    let query = `
+      SELECT *
+      FROM alarms
+      WHERE tag_id = ?
+        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    `;
+
+    const params = [tagId, parseInt(days)];
+
+    if (status) {
+      query += ` AND status = ?`;
+      params.push(status);
+    }
+
+    if (priority) {
+      query += ` AND priority = ?`;
+      params.push(priority);
+    }
+
+    query += ` ORDER BY triggered_at DESC LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), parseInt(offset));
+
+    const [rows] = await connection.execute(query, params);
+
+    // Get tag info
+    const [tagInfo] = await connection.execute(`
+      SELECT * FROM analog_input_tags WHERE tag_id = ? LIMIT 1
+    `, [tagId]);
+
+    // Get count and statistics
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM alarms
+      WHERE tag_id = ?
+        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    `;
+    const countParams = [tagId, parseInt(days)];
+
+    if (status) {
+      countQuery += ` AND status = ?`;
+      countParams.push(status);
+    }
+    if (priority) {
+      countQuery += ` AND priority = ?`;
+      countParams.push(priority);
+    }
+
+    const [countResult] = await connection.execute(countQuery, countParams);
+
+    const [tagStats] = await connection.execute(`
+      SELECT 
+        tag_name,
+        tag_type,
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active,
+        SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved,
+        SUM(CASE WHEN priority = 'CRITICAL' THEN 1 ELSE 0 END) as critical,
+        SUM(CASE WHEN priority = 'MODERATE' THEN 1 ELSE 0 END) as moderate,
+        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, resolved_at)) as avg_resolution_minutes
+      FROM alarms
+      WHERE tag_id = ?
+        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    `, [tagId, parseInt(days)]);
+
+    connection.release();
+
+    apiResponse(res, 200, `Alarms retrieved by tag: ${tagId}`, {
+      tagId: tagId,
+      tagName: tagInfo[0]?.description || tagId,
+      tagType: tagInfo[0]?.unit || "unknown",
+      period: { days: parseInt(days) },
+      statistics: {
+        total: tagStats[0]?.total || 0,
+        active: tagStats[0]?.active || 0,
+        resolved: tagStats[0]?.resolved || 0,
+        critical: tagStats[0]?.critical || 0,
+        moderate: tagStats[0]?.moderate || 0,
+        avgResolutionMinutes: parseFloat(tagStats[0]?.avg_resolution_minutes) || 0
+      },
+      pagination: {
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        total: countResult[0].total,
+        pages: Math.ceil(countResult[0].total / parseInt(limit))
+      },
+      alarms: rows
+    });
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// GET combined filter (advanced filtering)
+app.get("/api/alarms/filter", async (req, res) => {
+  let connection;
+  try {
+    const { 
+      tagId, 
+      priority, 
+      status, 
+      startDate, 
+      endDate, 
+      days = 30,
+      limit = 50, 
+      offset = 0,
+      sortBy = "triggered_at"
+    } = req.query;
+
+    connection = await pool.getConnection();
+
+    let query = `SELECT * FROM alarms WHERE 1=1`;
+    const params = [];
+
+    // Date range filter
+    if (startDate && endDate) {
+      query += ` AND triggered_at BETWEEN ? AND ?`;
+      params.push(startDate, endDate);
+    } else {
+      query += ` AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
+      params.push(parseInt(days));
+    }
+
+    // Tag filter
+    if (tagId) {
+      query += ` AND tag_id = ?`;
+      params.push(tagId);
+    }
+
+    // Priority filter
+    if (priority) {
+      query += ` AND priority = ?`;
+      params.push(priority);
+    }
+
+    // Status filter
+    if (status) {
+      query += ` AND status = ?`;
+      params.push(status);
+    }
+
+    // Sorting
+    const allowedSortFields = ["triggered_at", "resolved_at", "acknowledged_at", "priority", "tag_id", "status"];
+    const sortField = allowedSortFields.includes(sortBy) ? sortBy : "triggered_at";
+    query += ` ORDER BY ${sortField} DESC LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit), parseInt(offset));
+
+    const [rows] = await connection.execute(query, params);
+
+    // Get total count
+    let countQuery = `SELECT COUNT(*) as total FROM alarms WHERE 1=1`;
+    const countParams = [];
+
+    if (startDate && endDate) {
+      countQuery += ` AND triggered_at BETWEEN ? AND ?`;
+      countParams.push(startDate, endDate);
+    } else {
+      countQuery += ` AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
+      countParams.push(parseInt(days));
+    }
+
+    if (tagId) {
+      countQuery += ` AND tag_id = ?`;
+      countParams.push(tagId);
+    }
+
+    if (priority) {
+      countQuery += ` AND priority = ?`;
+      countParams.push(priority);
+    }
+
+    if (status) {
+      countQuery += ` AND status = ?`;
+      countParams.push(status);
+    }
+
+    const [countResult] = await connection.execute(countQuery, countParams);
+
+    // Get aggregated statistics
+    let statsQuery = `
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active,
+        SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved,
+        SUM(CASE WHEN priority = 'CRITICAL' THEN 1 ELSE 0 END) as critical,
+        SUM(CASE WHEN priority = 'MODERATE' THEN 1 ELSE 0 END) as moderate,
+        SUM(CASE WHEN priority = 'HEALTHY' THEN 1 ELSE 0 END) as healthy,
+        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, resolved_at)) as avg_resolution_minutes,
+        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, acknowledged_at)) as avg_acknowledgement_minutes,
+        MIN(triggered_at) as first_alarm,
+        MAX(resolved_at) as last_resolved
+      FROM alarms WHERE 1=1
+    `;
+    const statsParams = [];
+
+    if (startDate && endDate) {
+      statsQuery += ` AND triggered_at BETWEEN ? AND ?`;
+      statsParams.push(startDate, endDate);
+    } else {
+      statsQuery += ` AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
+      statsParams.push(parseInt(days));
+    }
+
+    if (tagId) {
+      statsQuery += ` AND tag_id = ?`;
+      statsParams.push(tagId);
+    }
+
+    if (priority) {
+      statsQuery += ` AND priority = ?`;
+      statsParams.push(priority);
+    }
+
+    if (status) {
+      statsQuery += ` AND status = ?`;
+      statsParams.push(status);
+    }
+
+    const [statsResult] = await connection.execute(statsQuery, statsParams);
+
+    connection.release();
+
+    apiResponse(res, 200, "Alarms retrieved with advanced filtering", {
+      filters: {
+        tagId: tagId || null,
+        priority: priority || null,
+        status: status || null,
+        dateRange: {
+          startDate: startDate || null,
+          endDate: endDate || null,
+          days: !startDate && !endDate ? parseInt(days) : null
+        }
+      },
+      pagination: {
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        total: countResult[0].total,
+        pages: Math.ceil(countResult[0].total / parseInt(limit))
+      },
+      statistics: {
+        total: statsResult[0]?.total || 0,
+        byStatus: {
+          active: statsResult[0]?.active || 0,
+          resolved: statsResult[0]?.resolved || 0
+        },
+        byPriority: {
+          critical: statsResult[0]?.critical || 0,
+          moderate: statsResult[0]?.moderate || 0,
+          healthy: statsResult[0]?.healthy || 0
+        },
+        responseMetrics: {
+          avgResolutionMinutes: parseFloat(statsResult[0]?.avg_resolution_minutes) || 0,
+          avgAcknowledgementMinutes: parseFloat(statsResult[0]?.avg_acknowledgement_minutes) || 0
+        },
+        timeRange: {
+          firstAlarm: statsResult[0]?.first_alarm,
+          lastResolved: statsResult[0]?.last_resolved
+        }
+      },
+      alarms: rows
+    });
+  } catch (error) {
+    handleError(res, error);
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 app.get("/api/alarms/stats/summary", async (req, res) => {
   try {
     const connection = await pool.getConnection();
@@ -329,13 +866,34 @@ app.get("/api/alarms/stats/summary", async (req, res) => {
         SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved,
         SUM(CASE WHEN priority = 'CRITICAL' THEN 1 ELSE 0 END) as critical,
         SUM(CASE WHEN priority = 'MODERATE' THEN 1 ELSE 0 END) as moderate,
-        SUM(CASE WHEN priority = 'HEALTHY' THEN 1 ELSE 0 END) as healthy
+        SUM(CASE WHEN priority = 'HEALTHY' THEN 1 ELSE 0 END) as healthy,
+        ROUND(AVG(TIMESTAMPDIFF(SECOND, triggered_at, resolved_at)) / 60, 2) as avg_resolution_time_minutes,
+        ROUND(AVG(TIMESTAMPDIFF(SECOND, triggered_at, acknowledged_at)) / 60, 2) as avg_acknowledgement_time_minutes,
+        MIN(triggered_at) as first_alarm_at,
+        MAX(resolved_at) as last_resolved_at
       FROM alarms
     `);
 
     connection.release();
 
-    apiResponse(res, 200, "Alarm statistics retrieved", stats[0]);
+    const summaryData = stats[0] || {};
+    
+    apiResponse(res, 200, "Alarm statistics retrieved", {
+      total: summaryData.total || 0,
+      active: summaryData.active || 0,
+      resolved: summaryData.resolved || 0,
+      bySeverity: {
+        critical: summaryData.critical || 0,
+        moderate: summaryData.moderate || 0,
+        healthy: summaryData.healthy || 0
+      },
+      responseMetrics: {
+        avgResolutionTimeMinutes: parseFloat(summaryData.avg_resolution_time_minutes) || 0,
+        avgAcknowledgementTimeMinutes: parseFloat(summaryData.avg_acknowledgement_time_minutes) || 0,
+        firstAlarmAt: summaryData.first_alarm_at,
+        lastResolvedAt: summaryData.last_resolved_at
+      }
+    });
   } catch (error) {
     handleError(res, error);
   }
@@ -709,7 +1267,6 @@ app.get("/api/machine-runtime/total-time", async (req, res) => {
 });
 
 
-
 // GET daily running time report (Running + Idle + Random Fault)
 app.get("/api/machine-runtime/daily-report", async (req, res) => {
   let connection;
@@ -871,7 +1428,10 @@ app.get("/api/alarms/frequency/by-type", async (req, res) => {
         SUM(CASE WHEN priority = 'HEALTHY' THEN 1 ELSE 0 END) as healthy_count,
         SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active_count,
         SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved_count,
-        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, resolved_at)) as avg_resolution_time_minutes
+        ROUND(AVG(TIMESTAMPDIFF(SECOND, triggered_at, resolved_at)) / 60, 2) as avg_resolution_time_minutes,
+        ROUND(AVG(TIMESTAMPDIFF(SECOND, triggered_at, acknowledged_at)) / 60, 2) as avg_acknowledgement_time_minutes,
+        MIN(TIMESTAMPDIFF(SECOND, triggered_at, resolved_at)) / 60 as min_resolution_time_minutes,
+        MAX(TIMESTAMPDIFF(SECOND, triggered_at, resolved_at)) / 60 as max_resolution_time_minutes
       FROM alarms
       WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
     `, [parseInt(days)]);
@@ -879,7 +1439,23 @@ app.get("/api/alarms/frequency/by-type", async (req, res) => {
     connection.release();
 
     apiResponse(res, 200, "Alarm frequency data retrieved", {
-      summary: alarmStats[0],
+      period: { days: parseInt(days) },
+      summary: {
+        totalAlarms: alarmStats[0]?.total_alarms || 0,
+        activeCount: alarmStats[0]?.active_count || 0,
+        resolvedCount: alarmStats[0]?.resolved_count || 0,
+        bySeverity: {
+          critical: alarmStats[0]?.critical_count || 0,
+          moderate: alarmStats[0]?.moderate_count || 0,
+          healthy: alarmStats[0]?.healthy_count || 0
+        },
+        responseMetrics: {
+          avgResolutionTimeMinutes: parseFloat(alarmStats[0]?.avg_resolution_time_minutes) || 0,
+          avgAcknowledgementTimeMinutes: parseFloat(alarmStats[0]?.avg_acknowledgement_time_minutes) || 0,
+          minResolutionTimeMinutes: parseFloat(alarmStats[0]?.min_resolution_time_minutes) || 0,
+          maxResolutionTimeMinutes: parseFloat(alarmStats[0]?.max_resolution_time_minutes) || 0
+        }
+      },
       frequencyByPriority: frequencyByPriority,
       frequencyByTag: frequencyByTag,
       frequencyTrend: frequencyTrend
@@ -929,17 +1505,7 @@ app.get("/api/alarms/frequency/pie-chart", async (req, res) => {
 });
 
 
-
-
-
-// ==================== HEALTH CHECK ====================
-
-app.get("/api/health", (req, res) => {
-  apiResponse(res, 200, "API is running");
-});
-
 // ==================== ERROR HANDLER ====================
-
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   apiResponse(res, 500, "Internal Server Error");
@@ -1035,6 +1601,7 @@ class AlarmTracker {
 }
 
 // Alarm thresholds for all tag types
+//============================================================================
 const ALARM_THRESHOLDS = {
   // Digital Inputs - alarm when value changes to 1 (trigger state)
   "DI-001": { moderate: 1, critical: 1, unit: "" },
@@ -1072,14 +1639,14 @@ const ALARM_LEVELS = {
 };
 
 const DIGITAL_INPUT_TAGS = [
-  { id: 1, tagId: "DI-001", description: "Voltage Protection Relay" },
+  { id: 1, tagId: "DI-001", description: "Voltage Protection" },
   { id: 2, tagId: "DI-002", description: "Emergency Stop" },
   { id: 3, tagId: "DI-003", description: "Buzzer Reset PB" },
   { id: 4, tagId: "DI-004", description: "Mixer VFD Trip" },
-  { id: 5, tagId: "DI-005", description: "Mixer VFD Run" },
+  { id: 5, tagId: "DI-005", description: "Mixer VFD Running" },
   { id: 6, tagId: "DI-006", description: "Mixer VFD Healthy" },
   { id: 7, tagId: "DI-007", description: "Circulation Pump Trip" },
-  { id: 8, tagId: "DI-008", description: "Circulation Pump Run" },
+  { id: 8, tagId: "DI-008", description: "Circulation Pump Running" },
 ];
 
 const DIGITAL_OUTPUT_TAGS = [
@@ -1090,9 +1657,9 @@ const DIGITAL_OUTPUT_TAGS = [
 ];
 
 const ANALOG_INPUT_TAGS = [
-  { tagId: "AI-001", description: "Line 1 - Pressure", unit: "bar", baseValue: 5, volatility: 1.5, minValue: 0, maxValue: 10 },
-  { tagId: "AI-002", description: "Line 1 - Temprature", unit: "°C", baseValue: 50, volatility: 8, minValue: 0, maxValue: 100 },
-  { tagId: "AI-003", description: "Line 2 - Temprature", unit: "°C", baseValue: 48, volatility: 7, minValue: 0, maxValue: 100 },
+  { tagId: "AI-001", description: "Line 1 - Pressure", unit: "bar", baseValue: 5, volatility: 4, minValue: 0, maxValue: 10 },
+  { tagId: "AI-002", description: "Line 1 - Temprature", unit: "°C", baseValue: 50, volatility: 30, minValue: 0, maxValue: 100 },
+  { tagId: "AI-003", description: "Line 2 - Temprature", unit: "°C", baseValue: 48, volatility: 20, minValue: 0, maxValue: 100 },
   { tagId: "AI-004", description: "DO Trasnmitter", unit: "%", baseValue: 45, volatility: 12, minValue: 0, maxValue: 100 },
   { tagId: "AI-005", description: "Load Cell", unit: "kg", baseValue: 25, volatility: 3, minValue: 0, maxValue: 50 },
   { tagId: "AI-006", description: "Cond PH Sensor", unit: "pH", baseValue: 7, volatility: 0.8, minValue: 0, maxValue: 14 },
@@ -1121,7 +1688,7 @@ function getAlarmLevel(tagId, value, tagType) {
   // For digital tags, alarm triggers when value equals 1
   if (tagType === "DIGITAL_INPUT" || tagType === "DIGITAL_OUTPUT") {
     if (value === 1 || value === true) {
-      return "CRITICAL"; // Digital state changes are critical
+      return "Critical"; // Digital state changes are critical
     }
     return "HEALTHY";
   }
@@ -1231,6 +1798,12 @@ function createAlarmObject(tagId, value, alarmLevel, timestamp, tagType, tagInfo
     );
   }
 
+  // Generate random acknowledgment time (30 seconds to 1 minute after trigger)
+  const acknowledgedTime = new Date(timestamp.getTime() + Math.random() * 30000 + 30000);
+  
+  // Generate random resolved time (2-3 minutes after trigger)
+  const resolvedTime = new Date(timestamp.getTime() + (120000 + Math.random() * 60000));
+
   return {
     id: generateAlarmId(),
     tag_id: tagId,
@@ -1240,12 +1813,13 @@ function createAlarmObject(tagId, value, alarmLevel, timestamp, tagType, tagInfo
     description,
     triggered_value: `${value}${unit ? ' ' + unit : ''}`,
     triggered_at: timestamp.toISOString(),
-    acknowledged_at: null,
-    resolved_at: null,
-    status: "ACTIVE"
+    acknowledged_at: acknowledgedTime.toISOString(),
+    resolved_at: resolvedTime.toISOString(),
+    status: "RESOLVED"
   };
 }
 
+//============================================================================
 
 const alarmTracker = new AlarmTracker();
 let dataStreamCounter = 0;
@@ -1272,20 +1846,106 @@ async function publishSampleData() {
     const timestamp = new Date();
     dataStreamCounter++;
 
-    // Generate Digital Inputs
+    // Generate Digital Inputs with correlated values
     const digitalInputs = [];
-    for (const tag of DIGITAL_INPUT_TAGS) {
-      const value = generateRandomBoolean();
-      await connection.execute(
-        "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
-        [tag.tagId, value ? 1 : 0, timestamp]
-      );
-      digitalInputs.push({
-        tagId: tag.tagId,
-        description: tag.description,
-        value: value,
-      });
-    }
+    
+    // Generate random base states
+    const hasVoltageFault = generateRandomBoolean();
+    const emergencyStopActive = generateRandomBoolean();
+    const buzzerActive = generateRandomBoolean();
+    const mixerTrip = generateRandomBoolean();
+    const pumpTrip = generateRandomBoolean();
+    
+    // DI-001: Voltage Protection (1 = fault/unhealthy, 0 = healthy)
+    await connection.execute(
+      "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
+      ["DI-001", hasVoltageFault ? 1 : 0, timestamp]
+    );
+    digitalInputs.push({
+      tagId: "DI-001",
+      description: "Voltage Protection",
+      value: hasVoltageFault,
+    });
+
+    // DI-002: Emergency Stop (1 = operated/active, 0 = not operated)
+    await connection.execute(
+      "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
+      ["DI-002", emergencyStopActive ? 1 : 0, timestamp]
+    );
+    digitalInputs.push({
+      tagId: "DI-002",
+      description: "Emergency Stop",
+      value: emergencyStopActive,
+    });
+
+    // DI-003: Buzzer Reset PB (1 = operated, 0 = unoperated)
+    await connection.execute(
+      "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
+      ["DI-003", buzzerActive ? 1 : 0, timestamp]
+    );
+    digitalInputs.push({
+      tagId: "DI-003",
+      description: "Buzzer Reset PB",
+      value: buzzerActive,
+    });
+
+    // DI-004: Mixer VFD Trip (1 = trip/fault, 0 = no trip)
+    await connection.execute(
+      "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
+      ["DI-004", mixerTrip ? 1 : 0, timestamp]
+    );
+    digitalInputs.push({
+      tagId: "DI-004",
+      description: "Mixer VFD Trip",
+      value: mixerTrip,
+    });
+
+    // DI-005: Mixer VFD Running (opposite of trip: 1 = running, 0 = not running)
+    const mixerRunning = !mixerTrip;
+    await connection.execute(
+      "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
+      ["DI-005", mixerRunning ? 1 : 0, timestamp]
+    );
+    digitalInputs.push({
+      tagId: "DI-005",
+      description: "Mixer VFD Running",
+      value: mixerRunning,
+    });
+
+    // DI-006: Mixer VFD Healthy (opposite of trip: 1 = healthy, 0 = unhealthy)
+    const mixerHealthy = !mixerTrip;
+    await connection.execute(
+      "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
+      ["DI-006", mixerHealthy ? 1 : 0, timestamp]
+    );
+    digitalInputs.push({
+      tagId: "DI-006",
+      description: "Mixer VFD Healthy",
+      value: mixerHealthy,
+    });
+
+    // DI-007: Circulation Pump Trip (1 = trip/fault, 0 = no trip)
+    await connection.execute(
+      "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
+      ["DI-007", pumpTrip ? 1 : 0, timestamp]
+    );
+    digitalInputs.push({
+      tagId: "DI-007",
+      description: "Circulation Pump Trip",
+      value: pumpTrip,
+    });
+
+    // DI-008: Circulation Pump Running (opposite of trip: 1 = running, 0 = not running)
+    const pumpRunning = !pumpTrip;
+    await connection.execute(
+      "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
+      ["DI-008", pumpRunning ? 1 : 0, timestamp]
+    );
+    digitalInputs.push({
+      tagId: "DI-008",
+      description: "Circulation Pump Running",
+      value: pumpRunning,
+    });
 
 
     // Generate Digital Outputs
@@ -1347,8 +2007,8 @@ async function publishSampleData() {
       try {
         // Check if table structure exists, if not create simplified version
         await connection.execute(
-          `INSERT INTO alarms (id, tag_id, tag_type, tag_name, priority, description, triggered_value, triggered_at, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO alarms (id, tag_id, tag_type, tag_name, priority, description, triggered_value, triggered_at, acknowledged_at, resolved_at, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             alarm.id,
             alarm.tag_id,
@@ -1357,7 +2017,9 @@ async function publishSampleData() {
             alarm.priority,
             alarm.description,
             alarm.triggered_value,
-            timestamp,
+            alarm.triggered_at,
+            alarm.acknowledged_at,
+            alarm.resolved_at,
             alarm.status,
             timestamp
           ]
