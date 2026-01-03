@@ -4,7 +4,10 @@ const alarmService = require("../service/alarmService");
 class AlarmController {
   async getAllAlarms(req, res, next) {
     try {
-      const { status = "ACTIVE", priority, limit = 10, offset = 0 } = req.query;
+      let { status, priority, limit = 10, offset = 0 } = req.query;
+      // Ignore empty query params so they don't add filters unintentionally
+      status = status || undefined;
+      priority = priority || undefined;
       const alarms = await alarmService.getAllAlarms({
         status,
         priority,

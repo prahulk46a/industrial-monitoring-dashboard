@@ -36,7 +36,9 @@ app.listen(PORT, async () => {
     console.log("GET /api/analog-outputs/tags");
 
     console.log("\n--- Alarms ---");
-    console.log("GET /api/alarms?status=ACTIVE&limit=10&offset=0");
+    console.log(
+      "GET /api/alarms?status={status}&limit=10&offset=0  (status optional)"
+    );
     console.log("GET /api/alarms/:alarmId");
     console.log("GET /api/alarms/by-tag/:tagId?days=30&limit=50");
     console.log("GET /api/alarms/stats/summary?days=30");

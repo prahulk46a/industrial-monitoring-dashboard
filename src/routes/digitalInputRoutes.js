@@ -7,17 +7,20 @@ const router = express.Router();
 // GET digital input readings (latest)
 router.get("/readings", async (req, res, next) => {
   try {
-    const { limit = 8 } = req.query;
+    let { limit } = req.query;
+    limit = parseInt(limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 8;
+
     const connection = await pool.getConnection();
 
     const query = `
       SELECT dir.*, dit.description 
       FROM digital_input_readings dir
       JOIN digital_input_tags dit ON dir.tag_id = dit.tag_id
-      ORDER BY dir.id DESC LIMIT ?
+      ORDER BY dir.id DESC LIMIT ${limit}
     `;
 
-    const [rows] = await connection.execute(query, [parseInt(limit)]);
+    const [rows] = await connection.execute(query);
     connection.release();
 
     apiResponse(res, 200, "Digital input readings retrieved", rows.reverse());

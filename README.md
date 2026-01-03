@@ -123,7 +123,7 @@ GET /api/analog-outputs/tags
 
 ### Alarms
 ```
-GET /api/alarms?status=ACTIVE&limit=10&offset=0
+GET /api/alarms?status={status}&limit=10&offset=0  (status optional)
 GET /api/alarms/:alarmId
 GET /api/alarms/by-tag/:tagId?days=30&limit=50
 GET /api/alarms/stats/summary?days=30

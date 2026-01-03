@@ -2,7 +2,13 @@ const pool = require("../../config/database");
 
 class AlarmRepository {
   async getAllAlarms(filters) {
-    const { status, priority, limit = 10, offset = 0 } = filters;
+    let { status, priority } = filters || {};
+    // Coerce numeric values and guard against injection by forcing integers
+    let limit = parseInt(filters?.limit, 10);
+    let offset = parseInt(filters?.offset, 10);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 10;
+    if (!Number.isFinite(offset) || offset < 0) offset = 0;
+
     let query = "SELECT * FROM alarms WHERE 1=1";
     const params = [];
 
@@ -15,8 +21,8 @@ class AlarmRepository {
       params.push(priority);
     }
 
-    query += ` ORDER BY triggered_at DESC LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
+    // Inline numeric pagination values safely (they are validated integers above)
+    query += ` ORDER BY triggered_at DESC LIMIT ${limit} OFFSET ${offset}`;
 
     const connection = await pool.getConnection();
     const [rows] = await connection.execute(query, params);
@@ -89,9 +95,18 @@ class AlarmRepository {
   }
 
   async getAlarmsByTag(tagId, filters) {
-    const { status, priority, limit = 50, offset = 0, days = 30 } = filters;
-    let query = `SELECT * FROM alarms WHERE tag_id = ? AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
-    const params = [tagId, days];
+    let { status, priority } = filters || {};
+    let limit = parseInt(filters?.limit, 10);
+    let offset = parseInt(filters?.offset, 10);
+    let days = parseInt(filters?.days, 10);
+
+    if (!Number.isFinite(limit) || limit <= 0) limit = 50;
+    if (!Number.isFinite(offset) || offset < 0) offset = 0;
+    if (!Number.isFinite(days) || days <= 0) days = 30;
+
+    // Inline days and pagination after sanitizing
+    let query = `SELECT * FROM alarms WHERE tag_id = ? AND triggered_at >= DATE_SUB(NOW(), INTERVAL ${days} DAY)`;
+    const params = [tagId];
 
     if (status) {
       query += " AND status = ?";
@@ -102,8 +117,7 @@ class AlarmRepository {
       params.push(priority);
     }
 
-    query += ` ORDER BY triggered_at DESC LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
+    query += ` ORDER BY triggered_at DESC LIMIT ${limit} OFFSET ${offset}`;
 
     const connection = await pool.getConnection();
     const [rows] = await connection.execute(query, params);
@@ -113,16 +127,19 @@ class AlarmRepository {
   }
 
   async getAlarmStats(filters = {}) {
-    const { days = 30, tagId = null, priority = null, status = null } = filters;
+    let { days = 30, tagId = null, priority = null, status = null } = filters;
+    days = parseInt(days, 10);
+    if (!Number.isFinite(days) || days <= 0) days = 30;
+
     let query = `SELECT 
       COUNT(*) as total,
       SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active,
       SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved,
       SUM(CASE WHEN priority = 'CRITICAL' THEN 1 ELSE 0 END) as critical,
       SUM(CASE WHEN priority = 'MODERATE' THEN 1 ELSE 0 END) as moderate
-      FROM alarms WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
+      FROM alarms WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ${days} DAY)`;
 
-    const params = [days];
+    const params = [];
 
     if (tagId) {
       query += " AND tag_id = ?";
