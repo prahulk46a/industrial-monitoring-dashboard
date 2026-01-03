@@ -19,6 +19,7 @@ const ALARM_THRESHOLDS = {
   "AI-005": { moderate: 25, critical: 40, unit: "kg" },
   "AI-006": { moderate: 7, critical: 9, unit: "pH" },
   "AI-007": { moderate: 750, critical: 1200, unit: "RPM" },
+  "AI-008": { moderate: 50, critical: 75, unit: "%" },
   "AO-001": { moderate: 70, critical: 90, unit: "%" },
 };
 
@@ -113,6 +114,15 @@ const ANALOG_INPUT_TAGS = [
     volatility: 80,
     minValue: 0,
     maxValue: 1500,
+  },
+  {
+    tagId: "AI-008",
+    description: "Cond Transmitter",
+    unit: "%",
+    baseValue: 40,
+    volatility: 20,
+    minValue: 0,
+    maxValue: 100,
   },
 ];
 
