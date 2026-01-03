@@ -1,4 +1,8 @@
-const { generateAlarmId, getAlarmLevel } = require("./helpers");
+const {
+  generateAlarmId,
+  getAlarmLevel,
+  formatDateForMySQL,
+} = require("./helpers");
 const { generateAlarmDescription } = require("./alarmDescriptionGenerator");
 
 class AlarmTracker {
@@ -62,7 +66,7 @@ class AlarmTracker {
         return alarm;
       } else {
         existingAlarm.triggered_value = value;
-        existingAlarm.triggered_at = timestamp.toISOString();
+        existingAlarm.triggered_at = formatDateForMySQL(timestamp);
       }
     } else {
       if (existingAlarm) {
@@ -97,9 +101,9 @@ class AlarmTracker {
       priority: alarmLevel,
       description,
       triggered_value: `${value}`,
-      triggered_at: timestamp.toISOString(),
-      acknowledged_at: acknowledgedTime.toISOString(),
-      resolved_at: resolvedTime.toISOString(),
+      triggered_at: formatDateForMySQL(timestamp),
+      acknowledged_at: formatDateForMySQL(acknowledgedTime),
+      resolved_at: formatDateForMySQL(resolvedTime),
       status: "RESOLVED",
     };
   }
