@@ -42,7 +42,7 @@ function handleError(res, error, statusCode = 500) {
 // GET digital input readings (latest)
 app.get("/api/digital-inputs/readings", async (req, res) => {
   try {
-    const { limit = 8 } = req.query;
+    const { limit=8  } = req.query;
     const connection = await pool.getConnection();
    
 
@@ -171,7 +171,7 @@ app.get("/api/analog-inputs/readings", async (req, res) => {
   let connection;
   try {
     const { tagId, tag_id, status } = req.query;
-    const limit = Number(req.query.limit) || 10;
+    const limit = Number(req.query.limit) || 1000000;
 
     // support both param names
     const filterTagId = tagId || tag_id;
@@ -203,7 +203,7 @@ app.get("/api/analog-inputs/readings", async (req, res) => {
     }
 
     // ✅ inline LIMIT (NO placeholder)
-    query += ` ORDER BY air.id DESC LIMIT ${limit}`;
+    query += ` ORDER BY air.id LIMIT ${limit}`;
 
     const [rows] = await connection.query(query, params);
 
@@ -327,10 +327,10 @@ app.get("/api/equipment-status", async (req, res) => {
 
 // ==================== ALARM APIS ====================
 
-// GET all alarms with filters
+// GET all alarms with filters (status, priority, tag_id, date range)
 app.get("/api/alarms", async (req, res) => {
   try {
-    const { status = "ACTIVE", priority, limit = 10, offset = 0 } = req.query;
+    const { status , priority, tag_id, startDate, endDate, limit = 100000, offset = 0 } = req.query;
     const connection = await pool.getConnection();
 
     let query = `
@@ -347,6 +347,18 @@ app.get("/api/alarms", async (req, res) => {
       query += ` AND priority = '${priority}'`;
     }
 
+    if (tag_id) {
+      query += ` AND tag_id = '${tag_id}'`;
+    }
+
+    if (startDate) {
+      query += ` AND triggered_at >= '${startDate}'`;
+    }
+
+    if (endDate) {
+      query += ` AND triggered_at <= '${endDate}'`;
+    }
+
     query += ` ORDER BY triggered_at DESC LIMIT ${Number(limit)} OFFSET ${Number(offset)}`;
 
     const [rows] = await connection.execute(query);
@@ -355,6 +367,12 @@ app.get("/api/alarms", async (req, res) => {
     apiResponse(res, 200, "Alarms retrieved", {
       limit: Number(limit),
       offset: Number(offset),
+      filters: {
+        status,
+        priority,
+        tag_id,
+        dateRange: { startDate, endDate }
+      },
       alarms: rows
     });
   } catch (error) {
@@ -362,27 +380,10 @@ app.get("/api/alarms", async (req, res) => {
   }
 });
 
+//Custom range Query for Alarms
 
-// GET specific alarm
-app.get("/api/alarms/:alarmId", async (req, res) => {
-  try {
-    const { alarmId } = req.params;
-    const connection = await pool.getConnection();
-    const [rows] = await connection.execute(
-      "SELECT * FROM alarms WHERE id = ?",
-      [alarmId]
-    );
-    connection.release();
 
-    if (rows.length === 0) {
-      return apiResponse(res, 404, "Alarm not found");
-    }
 
-    apiResponse(res, 200, "Alarm retrieved", rows[0]);
-  } catch (error) {
-    handleError(res, error);
-  }
-});
 
 // ACKNOWLEDGE alarm
 app.post("/api/alarms/:alarmId/acknowledge", async (req, res) => {
@@ -422,438 +423,6 @@ app.post("/api/alarms/:alarmId/resolve", async (req, res) => {
   }
 });
 
-// ==================== CUSTOM ALARM FILTER APIS ====================
-
-// GET alarms by date range
-app.get("/api/alarms/range/:startDate/:endDate", async (req, res) => {
-  let connection;
-  try {
-    const { startDate, endDate } = req.params;
-    const { status, priority, limit = 50, offset = 0 } = req.query;
-
-    connection = await pool.getConnection();
-
-    let query = `
-      SELECT *
-      FROM alarms
-      WHERE triggered_at BETWEEN ? AND ?
-    `;
-
-    const params = [startDate, endDate];
-
-    if (status) {
-      query += ` AND status = ?`;
-      params.push(status);
-    }
-
-    if (priority) {
-      query += ` AND priority = ?`;
-      params.push(priority);
-    }
-
-    query += ` ORDER BY triggered_at DESC LIMIT ? OFFSET ?`;
-    params.push(parseInt(limit), parseInt(offset));
-
-    const [rows] = await connection.execute(query, params);
-    
-    // Get total count for pagination
-    let countQuery = `
-      SELECT COUNT(*) as total
-      FROM alarms
-      WHERE triggered_at BETWEEN ? AND ?
-    `;
-    const countParams = [startDate, endDate];
-    
-    if (status) {
-      countQuery += ` AND status = ?`;
-      countParams.push(status);
-    }
-    if (priority) {
-      countQuery += ` AND priority = ?`;
-      countParams.push(priority);
-    }
-
-    const [countResult] = await connection.execute(countQuery, countParams);
-    
-    connection.release();
-
-    apiResponse(res, 200, "Alarms retrieved by date range", {
-      period: { startDate, endDate },
-      pagination: {
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        total: countResult[0].total,
-        pages: Math.ceil(countResult[0].total / parseInt(limit))
-      },
-      filters: { status, priority },
-      alarms: rows
-    });
-  } catch (error) {
-    handleError(res, error);
-  } finally {
-    if (connection) connection.release();
-  }
-});
-
-// GET alarms by priority
-app.get("/api/alarms/by-priority/:priority", async (req, res) => {
-  let connection;
-  try {
-    const { priority } = req.params;
-    const { status, limit = 50, offset = 0, days = 30 } = req.query;
-
-    connection = await pool.getConnection();
-
-    let query = `
-      SELECT *
-      FROM alarms
-      WHERE priority = ?
-        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `;
-
-    const params = [priority, parseInt(days)];
-
-    if (status) {
-      query += ` AND status = ?`;
-      params.push(status);
-    }
-
-    query += ` ORDER BY triggered_at DESC LIMIT ? OFFSET ?`;
-    params.push(parseInt(limit), parseInt(offset));
-
-    const [rows] = await connection.execute(query, params);
-
-    // Get count
-    let countQuery = `
-      SELECT COUNT(*) as total
-      FROM alarms
-      WHERE priority = ?
-        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `;
-    const countParams = [priority, parseInt(days)];
-
-    if (status) {
-      countQuery += ` AND status = ?`;
-      countParams.push(status);
-    }
-
-    const [countResult] = await connection.execute(countQuery, countParams);
-
-    // Get priority statistics
-    const [priorityStats] = await connection.execute(`
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active,
-        SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved,
-        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, resolved_at)) as avg_resolution_minutes
-      FROM alarms
-      WHERE priority = ?
-        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `, [priority, parseInt(days)]);
-
-    connection.release();
-
-    apiResponse(res, 200, `Alarms retrieved by priority: ${priority}`, {
-      priority: priority,
-      period: { days: parseInt(days) },
-      statistics: {
-        total: priorityStats[0]?.total || 0,
-        active: priorityStats[0]?.active || 0,
-        resolved: priorityStats[0]?.resolved || 0,
-        avgResolutionMinutes: parseFloat(priorityStats[0]?.avg_resolution_minutes) || 0
-      },
-      pagination: {
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        total: countResult[0].total,
-        pages: Math.ceil(countResult[0].total / parseInt(limit))
-      },
-      alarms: rows
-    });
-  } catch (error) {
-    handleError(res, error);
-  } finally {
-    if (connection) connection.release();
-  }
-});
-
-// GET alarms by tag
-app.get("/api/alarms/by-tag/:tagId", async (req, res) => {
-  let connection;
-  try {
-    const { tagId } = req.params;
-    const { status, priority, limit = 50, offset = 0, days = 30 } = req.query;
-
-    connection = await pool.getConnection();
-
-    let query = `
-      SELECT *
-      FROM alarms
-      WHERE tag_id = ?
-        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `;
-
-    const params = [tagId, parseInt(days)];
-
-    if (status) {
-      query += ` AND status = ?`;
-      params.push(status);
-    }
-
-    if (priority) {
-      query += ` AND priority = ?`;
-      params.push(priority);
-    }
-
-    query += ` ORDER BY triggered_at DESC LIMIT ? OFFSET ?`;
-    params.push(parseInt(limit), parseInt(offset));
-
-    const [rows] = await connection.execute(query, params);
-
-    // Get tag info
-    const [tagInfo] = await connection.execute(`
-      SELECT * FROM analog_input_tags WHERE tag_id = ? LIMIT 1
-    `, [tagId]);
-
-    // Get count and statistics
-    let countQuery = `
-      SELECT COUNT(*) as total
-      FROM alarms
-      WHERE tag_id = ?
-        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `;
-    const countParams = [tagId, parseInt(days)];
-
-    if (status) {
-      countQuery += ` AND status = ?`;
-      countParams.push(status);
-    }
-    if (priority) {
-      countQuery += ` AND priority = ?`;
-      countParams.push(priority);
-    }
-
-    const [countResult] = await connection.execute(countQuery, countParams);
-
-    const [tagStats] = await connection.execute(`
-      SELECT 
-        tag_name,
-        tag_type,
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active,
-        SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved,
-        SUM(CASE WHEN priority = 'CRITICAL' THEN 1 ELSE 0 END) as critical,
-        SUM(CASE WHEN priority = 'MODERATE' THEN 1 ELSE 0 END) as moderate,
-        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, resolved_at)) as avg_resolution_minutes
-      FROM alarms
-      WHERE tag_id = ?
-        AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `, [tagId, parseInt(days)]);
-
-    connection.release();
-
-    apiResponse(res, 200, `Alarms retrieved by tag: ${tagId}`, {
-      tagId: tagId,
-      tagName: tagInfo[0]?.description || tagId,
-      tagType: tagInfo[0]?.unit || "unknown",
-      period: { days: parseInt(days) },
-      statistics: {
-        total: tagStats[0]?.total || 0,
-        active: tagStats[0]?.active || 0,
-        resolved: tagStats[0]?.resolved || 0,
-        critical: tagStats[0]?.critical || 0,
-        moderate: tagStats[0]?.moderate || 0,
-        avgResolutionMinutes: parseFloat(tagStats[0]?.avg_resolution_minutes) || 0
-      },
-      pagination: {
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        total: countResult[0].total,
-        pages: Math.ceil(countResult[0].total / parseInt(limit))
-      },
-      alarms: rows
-    });
-  } catch (error) {
-    handleError(res, error);
-  } finally {
-    if (connection) connection.release();
-  }
-});
-
-// GET combined filter (advanced filtering)
-app.get("/api/alarms/filter", async (req, res) => {
-  let connection;
-  try {
-    const { 
-      tagId, 
-      priority, 
-      status, 
-      startDate, 
-      endDate, 
-      days = 30,
-      limit = 50, 
-      offset = 0,
-      sortBy = "triggered_at"
-    } = req.query;
-
-    connection = await pool.getConnection();
-
-    let query = `SELECT * FROM alarms WHERE 1=1`;
-    const params = [];
-
-    // Date range filter
-    if (startDate && endDate) {
-      query += ` AND triggered_at BETWEEN ? AND ?`;
-      params.push(startDate, endDate);
-    } else {
-      query += ` AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
-      params.push(parseInt(days));
-    }
-
-    // Tag filter
-    if (tagId) {
-      query += ` AND tag_id = ?`;
-      params.push(tagId);
-    }
-
-    // Priority filter
-    if (priority) {
-      query += ` AND priority = ?`;
-      params.push(priority);
-    }
-
-    // Status filter
-    if (status) {
-      query += ` AND status = ?`;
-      params.push(status);
-    }
-
-    // Sorting
-    const allowedSortFields = ["triggered_at", "resolved_at", "acknowledged_at", "priority", "tag_id", "status"];
-    const sortField = allowedSortFields.includes(sortBy) ? sortBy : "triggered_at";
-    query += ` ORDER BY ${sortField} DESC LIMIT ? OFFSET ?`;
-    params.push(parseInt(limit), parseInt(offset));
-
-    const [rows] = await connection.execute(query, params);
-
-    // Get total count
-    let countQuery = `SELECT COUNT(*) as total FROM alarms WHERE 1=1`;
-    const countParams = [];
-
-    if (startDate && endDate) {
-      countQuery += ` AND triggered_at BETWEEN ? AND ?`;
-      countParams.push(startDate, endDate);
-    } else {
-      countQuery += ` AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
-      countParams.push(parseInt(days));
-    }
-
-    if (tagId) {
-      countQuery += ` AND tag_id = ?`;
-      countParams.push(tagId);
-    }
-
-    if (priority) {
-      countQuery += ` AND priority = ?`;
-      countParams.push(priority);
-    }
-
-    if (status) {
-      countQuery += ` AND status = ?`;
-      countParams.push(status);
-    }
-
-    const [countResult] = await connection.execute(countQuery, countParams);
-
-    // Get aggregated statistics
-    let statsQuery = `
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active,
-        SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved,
-        SUM(CASE WHEN priority = 'CRITICAL' THEN 1 ELSE 0 END) as critical,
-        SUM(CASE WHEN priority = 'MODERATE' THEN 1 ELSE 0 END) as moderate,
-        SUM(CASE WHEN priority = 'HEALTHY' THEN 1 ELSE 0 END) as healthy,
-        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, resolved_at)) as avg_resolution_minutes,
-        AVG(TIMESTAMPDIFF(MINUTE, triggered_at, acknowledged_at)) as avg_acknowledgement_minutes,
-        MIN(triggered_at) as first_alarm,
-        MAX(resolved_at) as last_resolved
-      FROM alarms WHERE 1=1
-    `;
-    const statsParams = [];
-
-    if (startDate && endDate) {
-      statsQuery += ` AND triggered_at BETWEEN ? AND ?`;
-      statsParams.push(startDate, endDate);
-    } else {
-      statsQuery += ` AND triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
-      statsParams.push(parseInt(days));
-    }
-
-    if (tagId) {
-      statsQuery += ` AND tag_id = ?`;
-      statsParams.push(tagId);
-    }
-
-    if (priority) {
-      statsQuery += ` AND priority = ?`;
-      statsParams.push(priority);
-    }
-
-    if (status) {
-      statsQuery += ` AND status = ?`;
-      statsParams.push(status);
-    }
-
-    const [statsResult] = await connection.execute(statsQuery, statsParams);
-
-    connection.release();
-
-    apiResponse(res, 200, "Alarms retrieved with advanced filtering", {
-      filters: {
-        tagId: tagId || null,
-        priority: priority || null,
-        status: status || null,
-        dateRange: {
-          startDate: startDate || null,
-          endDate: endDate || null,
-          days: !startDate && !endDate ? parseInt(days) : null
-        }
-      },
-      pagination: {
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        total: countResult[0].total,
-        pages: Math.ceil(countResult[0].total / parseInt(limit))
-      },
-      statistics: {
-        total: statsResult[0]?.total || 0,
-        byStatus: {
-          active: statsResult[0]?.active || 0,
-          resolved: statsResult[0]?.resolved || 0
-        },
-        byPriority: {
-          critical: statsResult[0]?.critical || 0,
-          moderate: statsResult[0]?.moderate || 0,
-          healthy: statsResult[0]?.healthy || 0
-        },
-        responseMetrics: {
-          avgResolutionMinutes: parseFloat(statsResult[0]?.avg_resolution_minutes) || 0,
-          avgAcknowledgementMinutes: parseFloat(statsResult[0]?.avg_acknowledgement_minutes) || 0
-        },
-        timeRange: {
-          firstAlarm: statsResult[0]?.first_alarm,
-          lastResolved: statsResult[0]?.last_resolved
-        }
-      },
-      alarms: rows
-    });
-  } catch (error) {
-    handleError(res, error);
-  } finally {
-    if (connection) connection.release();
-  }
-});
 
 app.get("/api/alarms/stats/summary", async (req, res) => {
   try {
@@ -899,7 +468,6 @@ app.get("/api/alarms/stats/summary", async (req, res) => {
   }
 });
 
-// ==================== DASHBOARD APIS ====================
 
 // GET complete dashboard summary
 app.get("/api/dashboard/summary", async (req, res) => {
@@ -931,37 +499,7 @@ app.get("/api/dashboard/summary", async (req, res) => {
   }
 });
 
-// GET readings in time range
-app.get("/api/readings/time-range", async (req, res) => {
-  try {
-    const { tagId, startTime, endTime } = req.query;
 
-    if (!tagId || !startTime || !endTime) {
-      return apiResponse(
-        res,
-        400,
-        "Missing required parameters: tagId, startTime, endTime"
-      );
-    }
-
-    const connection = await pool.getConnection();
-
-    const [readings] = await connection.execute(
-      `SELECT * FROM analog_input_readings 
-       WHERE tag_id = ? AND timestamp BETWEEN ? AND ?
-       ORDER BY timestamp ASC`,
-      [tagId, startTime, endTime]
-    );
-
-    connection.release();
-
-    apiResponse(res, 200, "Time range readings retrieved", readings);
-  } catch (error) {
-    handleError(res, error);
-  }
-});
-
-// ==================== MACHINE RUNTIME OVERVIEW ====================
 
 // GET machine runtime statistics - Complete Dashboard View
 app.get("/api/machine-runtime/overview", async (req, res) => {
@@ -1361,111 +899,6 @@ app.get("/api/machine-runtime/daily-report", async (req, res) => {
 });
 
 
-// ==================== ALARM FREQUENCY BY TYPE ====================
-
-// GET alarm frequency by type/priority
-app.get("/api/alarms/frequency/by-type", async (req, res) => {
-  let connection;
-  try {
-    const { days = 7 } = req.query;
-
-    connection = await pool.getConnection();
-
-    // Get alarm frequency by priority
-    const [frequencyByPriority] = await connection.execute(`
-      SELECT 
-        priority,
-        COUNT(*) as count,
-        ROUND((COUNT(*) / (SELECT COUNT(*) FROM alarms WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)) * 100), 2) as percentage
-      FROM alarms
-      WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-      GROUP BY priority
-      ORDER BY 
-        CASE 
-          WHEN priority = 'CRITICAL' THEN 1
-          WHEN priority = 'MODERATE' THEN 2
-          ELSE 3
-        END
-    `, [parseInt(days), parseInt(days)]);
-
-    // Get alarm frequency by tag
-    const [frequencyByTag] = await connection.execute(`
-      SELECT 
-        tag_id,
-        (SELECT description FROM analog_input_tags WHERE tag_id = a.tag_id LIMIT 1) as description,
-        priority,
-        COUNT(*) as count,
-        DATE(triggered_at) as date
-      FROM alarms a
-      WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-      GROUP BY tag_id, priority, DATE(triggered_at)
-      ORDER BY tag_id, date DESC, count DESC
-    `, [parseInt(days)]);
-
-    // Get alarm frequency trend (daily)
-    const [frequencyTrend] = await connection.execute(`
-      SELECT 
-        DATE(triggered_at) as date,
-        priority,
-        COUNT(*) as count
-      FROM alarms
-      WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-      GROUP BY DATE(triggered_at), priority
-      ORDER BY date DESC, 
-        CASE 
-          WHEN priority = 'CRITICAL' THEN 1
-          WHEN priority = 'MODERATE' THEN 2
-          ELSE 3
-        END
-    `, [parseInt(days)]);
-
-    // Get alarm statistics summary
-    const [alarmStats] = await connection.execute(`
-      SELECT 
-        COUNT(*) as total_alarms,
-        SUM(CASE WHEN priority = 'CRITICAL' THEN 1 ELSE 0 END) as critical_count,
-        SUM(CASE WHEN priority = 'MODERATE' THEN 1 ELSE 0 END) as moderate_count,
-        SUM(CASE WHEN priority = 'HEALTHY' THEN 1 ELSE 0 END) as healthy_count,
-        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) as active_count,
-        SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved_count,
-        ROUND(AVG(TIMESTAMPDIFF(SECOND, triggered_at, resolved_at)) / 60, 2) as avg_resolution_time_minutes,
-        ROUND(AVG(TIMESTAMPDIFF(SECOND, triggered_at, acknowledged_at)) / 60, 2) as avg_acknowledgement_time_minutes,
-        MIN(TIMESTAMPDIFF(SECOND, triggered_at, resolved_at)) / 60 as min_resolution_time_minutes,
-        MAX(TIMESTAMPDIFF(SECOND, triggered_at, resolved_at)) / 60 as max_resolution_time_minutes
-      FROM alarms
-      WHERE triggered_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `, [parseInt(days)]);
-
-    connection.release();
-
-    apiResponse(res, 200, "Alarm frequency data retrieved", {
-      period: { days: parseInt(days) },
-      summary: {
-        totalAlarms: alarmStats[0]?.total_alarms || 0,
-        activeCount: alarmStats[0]?.active_count || 0,
-        resolvedCount: alarmStats[0]?.resolved_count || 0,
-        bySeverity: {
-          critical: alarmStats[0]?.critical_count || 0,
-          moderate: alarmStats[0]?.moderate_count || 0,
-          healthy: alarmStats[0]?.healthy_count || 0
-        },
-        responseMetrics: {
-          avgResolutionTimeMinutes: parseFloat(alarmStats[0]?.avg_resolution_time_minutes) || 0,
-          avgAcknowledgementTimeMinutes: parseFloat(alarmStats[0]?.avg_acknowledgement_time_minutes) || 0,
-          minResolutionTimeMinutes: parseFloat(alarmStats[0]?.min_resolution_time_minutes) || 0,
-          maxResolutionTimeMinutes: parseFloat(alarmStats[0]?.max_resolution_time_minutes) || 0
-        }
-      },
-      frequencyByPriority: frequencyByPriority,
-      frequencyByTag: frequencyByTag,
-      frequencyTrend: frequencyTrend
-    });
-  } catch (error) {
-    handleError(res, error);
-  } finally {
-    if (connection) connection.release();
-  }
-});
 
 // GET alarm frequency pie chart data (simplified)
 app.get("/api/alarms/frequency/pie-chart", async (req, res) => {
@@ -1639,14 +1072,14 @@ const ALARM_LEVELS = {
 };
 
 const DIGITAL_INPUT_TAGS = [
-  { id: 1, tagId: "DI-001", description: "Voltage Protection" },
+  { id: 1, tagId: "DI-001", description: "Voltage Protection Relay" },
   { id: 2, tagId: "DI-002", description: "Emergency Stop" },
   { id: 3, tagId: "DI-003", description: "Buzzer Reset PB" },
-  { id: 4, tagId: "DI-004", description: "Mixer VFD Trip" },
-  { id: 5, tagId: "DI-005", description: "Mixer VFD Running" },
-  { id: 6, tagId: "DI-006", description: "Mixer VFD Healthy" },
-  { id: 7, tagId: "DI-007", description: "Circulation Pump Trip" },
-  { id: 8, tagId: "DI-008", description: "Circulation Pump Running" },
+  { id: 4, tagId: "DI-004", description: "Mixer VFD Run F/B" },
+  { id: 5, tagId: "DI-005", description: "Mixer VFD Trip F/B" },
+  { id: 6, tagId: "DI-006", description: "Mixer VFD Healthy F/B" },
+  { id: 7, tagId: "DI-007", description: "Circulation Pump Trip F/B" },
+  { id: 8, tagId: "DI-008", description: "Circulation Pump Run F/B" },
 ];
 
 const DIGITAL_OUTPUT_TAGS = [
@@ -1855,6 +1288,9 @@ async function publishSampleData() {
     const buzzerActive = generateRandomBoolean();
     const mixerTrip = generateRandomBoolean();
     const pumpTrip = generateRandomBoolean();
+    const mixerRunning = !mixerTrip;
+    const mixerHealthy = !mixerTrip;
+    const pumpRunning = !pumpTrip;
     
     // DI-001: Voltage Protection (1 = fault/unhealthy, 0 = healthy)
     await connection.execute(
@@ -1889,31 +1325,30 @@ async function publishSampleData() {
       value: buzzerActive,
     });
 
-    // DI-004: Mixer VFD Trip (1 = trip/fault, 0 = no trip)
+    // DI-004: Mixer VFD Run (1 = running, 0 = not running)
     await connection.execute(
       "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
-      ["DI-004", mixerTrip ? 1 : 0, timestamp]
+      ["DI-004", mixerRunning ? 1 : 0, timestamp]
     );
     digitalInputs.push({
       tagId: "DI-004",
-      description: "Mixer VFD Trip",
-      value: mixerTrip,
+      description: "Mixer VFD Run",
+      value: mixerRunning,
     });
 
-    // DI-005: Mixer VFD Running (opposite of trip: 1 = running, 0 = not running)
-    const mixerRunning = !mixerTrip;
+    // DI-005: Mixer VFD Trip(opposite of trip: 1 = running, 0 = not running)
+    
     await connection.execute(
       "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
       ["DI-005", mixerRunning ? 1 : 0, timestamp]
     );
     digitalInputs.push({
       tagId: "DI-005",
-      description: "Mixer VFD Running",
+      description: "Mixer VFD Trip",
       value: mixerRunning,
     });
 
     // DI-006: Mixer VFD Healthy (opposite of trip: 1 = healthy, 0 = unhealthy)
-    const mixerHealthy = !mixerTrip;
     await connection.execute(
       "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
       ["DI-006", mixerHealthy ? 1 : 0, timestamp]
@@ -1936,7 +1371,7 @@ async function publishSampleData() {
     });
 
     // DI-008: Circulation Pump Running (opposite of trip: 1 = running, 0 = not running)
-    const pumpRunning = !pumpTrip;
+    
     await connection.execute(
       "INSERT INTO digital_input_readings (tag_id, value, timestamp) VALUES (?, ?, ?)",
       ["DI-008", pumpRunning ? 1 : 0, timestamp]
@@ -2017,11 +1452,11 @@ async function publishSampleData() {
             alarm.priority,
             alarm.description,
             alarm.triggered_value,
-            alarm.triggered_at,
-            alarm.acknowledged_at,
-            alarm.resolved_at,
+            new Date(alarm.triggered_at).toISOString().slice(0, 19).replace('T', ' '),
+            new Date(alarm.acknowledged_at).toISOString().slice(0, 19).replace('T', ' '),
+            new Date(alarm.resolved_at).toISOString().slice(0, 19).replace('T', ' '),
             alarm.status,
-            timestamp
+            timestamp.toISOString().slice(0, 19).replace('T', ' ')
           ]
         );
       } catch (dbError) {
